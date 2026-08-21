@@ -1,0 +1,13 @@
+/target
+config.toml
+*.db
+*.db-wal
+*.db-shm
+
+# Local operator notes, phone screenshots, and internal design docs. These are
+# deployment-specific and are deliberately not published.
+/ORIGINAL_SPEC.md
+/docs/
+IMG_*.png
+Screenshot*.png
+*.bak-*

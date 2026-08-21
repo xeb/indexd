@@ -1,0 +1,79 @@
+# indexd configuration.
+#
+#   cp config.example.toml ~/.config/indexd/config.toml
+#   chmod 600 ~/.config/indexd/config.toml
+#
+# Every setting except the token list also has an INDEXD_* environment
+# override, named in the comments below. The tokens deliberately do NOT, so
+# they stay out of the process environment and out of `systemctl show`.
+
+# port       = 7490                     # INDEXD_PORT
+# data_dir   = "~/.local/share/indexd"  # INDEXD_DATA_DIR   (SQLite lives here)
+# static_dir = "./static"               # INDEXD_STATIC     (console assets)
+
+# --- The tmux window ---------------------------------------------------------
+# window = "index MASTER"   # INDEXD_WINDOW
+# cwd    = "~"              # INDEXD_CWD  (working dir for a window we create)
+
+# Argv launched when the window is missing. Absent or empty means indexd will
+# never create a window: it refuses with an explanation instead of guessing at
+# your agent and launching the wrong process into a terminal. Create the window
+# yourself with tools/ensure-window.sh if you prefer.
+#
+# Whatever you name here is launched unattended. If your agent stops at a
+# first-run confirmation or a permission prompt, pass whatever flag skips it —
+# nothing is present to answer that prompt, and the first request will hang.
+# agent_command = ["my-agent", "--some-non-interactive-flag"]
+
+# How indexd reads your agent's terminal. Defaults suit one popular CLI agent;
+# change them for yours.
+#
+#   streaming_marker  what the TUI prints while a turn is in flight. Its
+#                     ABSENCE is how a finished turn is detected, so it must be
+#                     shown for the whole turn and never afterwards.
+#   dismiss_marker    a first-run confirmation to dismiss with Tab. Empty
+#                     disables it; harmless either way, since it only fires
+#                     when the pane actually contains the string.
+#
+# streaming_marker = "esc to interrupt"   # INDEXD_STREAMING_MARKER
+# dismiss_marker   = "bypass permissions" # INDEXD_DISMISS_MARKER
+
+# --- Webhook gate (/hook) ----------------------------------------------------
+# The ONLY thing standing between the internet and a shell-capable agent
+# session. An empty list rejects every request.
+#
+# Values are compared byte-for-byte, in constant time, against the WHOLE
+# Authorization header. List two representations of the same secret so the
+# phone's webhook screen can be configured either way:
+#
+#   Name=Authorization    Value=Bearer <token>
+#   Name=X-Widget-Token   Value=<token>
+#
+# Listing two *different* secrets instead lets you rotate with no downtime.
+[auth]
+tokens = [
+  "Bearer REPLACE_ME",
+  "REPLACE_ME",
+]
+
+# --- Console gate (optional) -------------------------------------------------
+# Cloudflare Access in front of the web console, verified in-process. Leave
+# unset if you are gating the console some other way (LAN only, a VPN, a
+# tailnet) — but note that ungated, the console exposes a log of everything you
+# have dictated and a switch that controls a shell-capable session.
+#
+# access_aud     = "<AUD of your Access application>"  # INDEXD_ACCESS_AUD
+# allowed_emails = ["you@example.com"]                 # INDEXD_ALLOWED_EMAILS
+# team_domain    = "yourteam.cloudflareaccess.com"     # INDEXD_TEAM_DOMAIN
+
+# Hostnames this daemon answers for. Loopback only by default; add your public
+# hostname when serving through a tunnel or reverse proxy.
+# allowed_hosts  = ["index.example.com", "localhost", "127.0.0.1"]  # INDEXD_ALLOWED_HOSTS
+
+# --- Timeouts ----------------------------------------------------------------
+# Nothing blocks on these: the webhook returns as soon as the request is
+# recorded, so a slow turn costs nothing but is still captured.
+[timeouts]
+# primary_secs     = 90    # first wait; crossing it is logged, not fatal
+# extended_secs    = 600   # hard deadline, measured from submission
+# poll_interval_ms = 200   # how often the pane is re-read

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#FFFFFF" id="theme-color">
+<title>indexd</title>
+<!-- Zero external requests. indexd is a loopback daemon behind a tunnel:
+     no CDN, no webfont fetch, no analytics, no favicon round trip.
+     The favicon is painted into a canvas at runtime and swapped in as a
+     data URL, so it tracks the injection state without touching the network. -->
+<link rel="icon" href="data:," id="favicon">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<!-- The bezel: a hairline frame on the viewport edge that is energised
+     vermilion while injection is LIVE and cold grey while it is HELD. It is
+     the cue you read without looking at the page. -->
+<div class="bezel" aria-hidden="true"></div>
+
+<header class="masthead">
+  <div class="wrap">
+    <div class="masthead-row">
+      <h1 class="wordmark">indexd</h1>
+
+      <!-- compact mirror of the breaker, so the state survives scrolling -->
+      <span class="chip" id="chip" aria-hidden="true">
+        <span class="chip-mark"></span>
+        <span class="chip-label">inj</span>
+        <span class="chip-word" id="chip-word">----</span>
+      </span>
+
+      <p class="feed">
+        <span class="dot" id="dot" data-state="idle"></span>
+        <span class="feed-word" id="link-word">idle</span>
+      </p>
+    </div>
+
+    <dl class="facts">
+      <div class="fact"><dt>host</dt><dd id="host">index.example.com</dd></div>
+      <div class="fact"><dt>window</dt><dd id="window">index MASTER</dd></div>
+      <div class="fact"><dt>cwd</dt><dd id="cwd">~</dd></div>
+      <div class="fact"><dt>port</dt><dd id="port">7490</dd></div>
+    </dl>
+  </div>
+</header>
+
+<!-- The breaker. The one consequential control on the page: it decides
+     whether spoken words are typed into a live agent session. -->
+<section class="band">
+  <div class="wrap">
+    <button type="button" class="breaker" id="breaker" role="switch" aria-checked="false" aria-disabled="true">
+      <span class="breaker-read">
+        <span class="breaker-label">injection</span>
+        <span class="breaker-word" id="breaker-word">----</span>
+        <span class="breaker-sub" id="breaker-sub">Reading state from indexd.</span>
+      </span>
+      <span class="track" aria-hidden="true">
+        <span class="track-fill"></span>
+        <span class="slug"><i></i><i></i><i></i></span>
+      </span>
+    </button>
+    <p class="breaker-msg" id="breaker-msg" hidden></p>
+  </div>
+</section>
+
+<main class="log wrap">
+  <div class="log-head">
+    <h2 class="log-title">transcript</h2>
+    <span class="rule"></span>
+    <span class="log-count" id="log-count"></span>
+  </div>
+
+  <p class="notice" id="notice" hidden></p>
+  <p class="empty" id="empty" hidden>No commands yet. Click and hold the ring, then talk.</p>
+  <div class="entries" id="entries"></div>
+
+  <noscript>
+    <p class="notice">This console reads a live feed and needs JavaScript. Enable it and reload.</p>
+  </noscript>
+</main>
+
+<p class="sr-only" id="announcer" role="status" aria-live="polite"></p>
+
+<script src="/app.js"></script>
+</body>
+</html>

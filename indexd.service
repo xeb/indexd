@@ -1,0 +1,71 @@
+# indexd — example user systemd unit.
+#
+# Install:
+#   cp indexd.service ~/.config/systemd/user/indexd.service
+#   $EDITOR ~/.config/systemd/user/indexd.service     # fill in the paths below
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now indexd.service
+#
+# Every path here is an example. Nothing in this file is a secret: the bearer
+# tokens live in the config file, which is not readable from `systemctl show`.
+
+[Unit]
+Description=indexd — Pebble Index 01 webhook -> tmux agent window
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/indexd
+ExecStart=%h/.local/bin/indexd
+Restart=always
+RestartSec=10
+
+Environment=INDEXD_CONFIG=%h/.config/indexd/config.toml
+Environment=INDEXD_DATA_DIR=%h/.local/share/indexd
+Environment=INDEXD_STATIC=%h/src/indexd/static
+Environment=RUST_LOG=indexd=info
+
+# The tmux window this drives, and where a window it creates should start.
+#
+# NOTE THE QUOTES. systemd splits `Environment=` on whitespace, so an unquoted
+#   Environment=INDEXD_WINDOW=index MASTER
+# silently sets INDEXD_WINDOW to just "index" — and if a window by that shorter
+# name happens to exist, the daemon will type into it instead. Quote any value
+# containing a space, and check `systemctl --user show indexd -p Environment`
+# after editing; the daemon also logs the window it resolved at startup.
+Environment="INDEXD_WINDOW=index MASTER"
+Environment=INDEXD_CWD=%h
+
+# Argv launched when the window is missing. Leave unset and indexd will refuse
+# to create a window rather than guess at your agent — create it yourself with
+# tools/ensure-window.sh instead. Whatever you put here runs unattended, so it
+# must not stop at an interactive confirmation; nothing is there to answer it.
+# Environment="INDEXD_AGENT_COMMAND=my-agent --some-non-interactive-flag"
+
+# `tmux` and your agent are both invoked by bare name, so both must be on PATH.
+# systemd gives a user service a minimal PATH, which is usually not enough.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+
+# --- Console gate (optional; see README "Security") -------------------------
+# Only needed if you put the console behind Cloudflare Access. Both must be set
+# or the console fails closed: every route but /health returns 401. That is the
+# intended posture for a page that shows everything you have ever dictated and
+# can drive a shell-capable session — if it is wrong, 401 is the correct
+# failure, not something to work around by unsetting it.
+# Environment=INDEXD_ALLOWED_EMAILS=you@example.com
+# Environment=INDEXD_TEAM_DOMAIN=yourteam.cloudflareaccess.com
+# Environment=INDEXD_ACCESS_AUD=<AUD of your Access application>
+
+# Hostnames the daemon will answer for. Loopback only by default; add your
+# public hostname when serving through a tunnel or reverse proxy, or requests
+# arriving with that Host are refused.
+# Environment=INDEXD_ALLOWED_HOSTS=index.example.com,localhost,127.0.0.1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=indexd
+
+[Install]
+WantedBy=default.target

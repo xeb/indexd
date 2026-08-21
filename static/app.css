@@ -1,0 +1,553 @@
+/* indexd console — the wire protocol, made legible, on white.
+
+   Two questions, in order of importance:
+     1. Is the line hot right now?          -> the breaker, and the bezel
+     2. Did what I said actually run?       -> the transcript
+
+   Nothing here loads from the network. No webfonts, no CDN, no icons: this is
+   a loopback daemon behind a tunnel and it must render correctly with the
+   machine offline. The type layer is two stacks only — a mono for everything
+   that is data (the page IS terminal output, so it is set as terminal output)
+   and a system sans used exclusively for letterspaced micro-labels.
+
+   Colour is state and only state. Vermilion (#FF3B1F, lifted from the Pebble
+   app's own chrome) means "energy in the line": injection live, a turn
+   running. Amber means a turn ended badly. Everything else is ink, rule, or
+   muted grey. */
+
+/* ── tokens ───────────────────────────────────────────────────────────── */
+
+:root {
+  --paper: #FFFFFF;
+  --ink:   #0B0D10;
+  --rule:  #E4E7EC;
+  --muted: #6B7280;
+  --live:  #FF3B1F;  /* injection live; a turn running */
+  --warn:  #B45309;  /* timed out, failed */
+
+  --live-wash: rgba(255, 59, 31, .07);
+  --ink-wash:  rgba(11, 13, 16, .05);
+  --bezel-cold: rgba(11, 13, 16, .18);   /* the frame, de-energised */
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "Liberation Mono", "DejaVu Sans Mono", monospace;
+  --label: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+           "Helvetica Neue", Arial, sans-serif;
+
+  --gutter: 1.5rem;
+  --measure: 68rem;
+  --bezel: 3px;
+  --track-w: 13rem;
+  --track-h: 3.75rem;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scrollbar-gutter: stable;
+  overflow-x: hidden;   /* the layout does not need it; this is the backstop */
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.55;
+  font-variant-ligatures: none;
+  padding-bottom: 5rem;
+  -webkit-font-smoothing: antialiased;
+  overflow-wrap: break-word;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
+  border-radius: 1px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.wrap {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding-left: var(--gutter);
+  padding-right: var(--gutter);
+}
+
+/* the one micro-label treatment, used everywhere a label is not data */
+.breaker-label,
+.chip-label,
+.log-title,
+.log-count,
+.facts dt,
+.feed-word,
+.status {
+  font-family: var(--label);
+  font-size: .6875rem;
+  font-weight: 600;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  font-feature-settings: "kern" 1;
+}
+
+/* ── the bezel: state, read in peripheral vision ──────────────────────── */
+
+.bezel {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  border: var(--bezel) solid var(--bezel-cold);
+  transition: border-color .22s ease;
+}
+
+:root[data-injection="live"] .bezel { border-color: var(--live); }
+:root[data-injection="held"] .bezel { border-color: var(--bezel-cold); }
+
+/* ── masthead ─────────────────────────────────────────────────────────── */
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+  padding-top: 1.15rem;
+  padding-bottom: .85rem;
+}
+
+.masthead-row {
+  display: flex;
+  align-items: center;
+  gap: .75rem 1rem;
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -.03em;
+  margin-right: auto;
+}
+
+/* compact breaker mirror — the state when the hero has scrolled away */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .2rem .5rem .22rem;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.chip-mark {
+  width: 7px; height: 7px;
+  flex: none;
+  border: 1.5px solid var(--muted);
+  background: transparent;
+}
+
+.chip-label { color: var(--muted); }
+
+.chip-word {
+  font-family: var(--mono);
+  font-size: .75rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+
+:root[data-injection="live"] .chip { border-color: var(--live); background: var(--live-wash); }
+:root[data-injection="live"] .chip-mark { border-color: var(--live); background: var(--live); }
+:root[data-injection="live"] .chip-label,
+:root[data-injection="live"] .chip-word { color: var(--live); }
+
+:root[data-injection="held"] .chip-mark { border-color: var(--ink); }
+:root[data-injection="held"] .chip-word { color: var(--ink); }
+
+/* feed health */
+
+.feed {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.feed-word { color: var(--muted); min-width: 7.5ch; }
+
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.dot[data-state="running"] {
+  background: var(--live);
+  animation: pulse 1.6s ease-out infinite;
+}
+
+.dot[data-state="reconnecting"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--muted);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 59, 31, .40); }
+  70%  { box-shadow: 0 0 0 7px rgba(255, 59, 31, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 59, 31, 0); }
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .35; }
+}
+
+/* the daemon's own facts, set as a label/value instrument row */
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .3rem 1.75rem;
+  margin: .8rem 0 0;
+}
+
+.fact {
+  display: flex;
+  align-items: baseline;
+  gap: .55rem;
+  min-width: 0;
+}
+
+.facts dt { color: var(--muted); flex: none; }
+
+.facts dd {
+  margin: 0;
+  font-size: .8125rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ── the breaker ──────────────────────────────────────────────────────── */
+
+.band {
+  border-bottom: 1px solid var(--rule);
+  padding-top: 2.25rem;
+  padding-bottom: 2.25rem;
+}
+
+.breaker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem 2rem;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.breaker[aria-disabled="true"] { cursor: default; }
+.breaker[data-pending] { cursor: progress; }
+
+.breaker:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 8px;
+  border-radius: 2px;
+}
+
+.breaker-read { min-width: 0; }
+
+.breaker-label {
+  display: block;
+  color: var(--muted);
+  margin-bottom: .5rem;
+}
+
+.breaker-word {
+  display: block;
+  font-family: var(--mono);
+  font-size: clamp(3rem, 12vw, 5.25rem);
+  font-weight: 700;
+  line-height: .92;
+  letter-spacing: .01em;
+  color: var(--muted);
+  transition: color .22s ease;
+}
+
+/* LIVE and HELD are both four monospaced characters: the word swaps in place
+   with no reflow, the way a mechanical indicator would. */
+:root[data-injection="live"] .breaker-word { color: var(--live); }
+:root[data-injection="held"] .breaker-word { color: var(--ink); }
+
+.breaker-sub {
+  display: block;
+  margin-top: .7rem;
+  font-size: .8125rem;
+  color: var(--muted);
+  max-width: 56ch;
+}
+
+.breaker-sub .w { color: var(--ink); }
+
+/* the switch itself: a machined throw, squared rather than a pill — this is a
+   breaker, not a preferences toggle */
+
+.track {
+  position: relative;
+  flex: none;
+  width: var(--track-w);
+  height: var(--track-h);
+  border: 1.5px solid var(--ink);
+  border-radius: 4px;
+  background: var(--paper);
+  overflow: hidden;
+  transition: box-shadow .15s ease, transform .1s ease;
+}
+
+.breaker:hover .track { box-shadow: 0 0 0 4px var(--ink-wash); }
+.breaker:active .track { transform: translateY(1px); }
+.breaker[aria-disabled="true"]:hover .track { box-shadow: none; }
+.breaker[aria-disabled="true"] .track { border-color: var(--muted); }
+
+.track-fill {
+  position: absolute;
+  inset: 0;
+  background: var(--live);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform .26s cubic-bezier(.2, .8, .2, 1);
+}
+
+:root[data-injection="live"] .track-fill { transform: scaleX(1); }
+
+.slug {
+  position: absolute;
+  top: 3px; bottom: 3px; left: 3px;
+  width: calc(50% - 3px);
+  background: var(--ink);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  transform: translateX(50%);   /* centred while the state is unknown */
+  transition: transform .26s cubic-bezier(.2, .8, .2, 1);
+}
+
+.breaker[aria-disabled="true"] .slug { background: var(--muted); }
+
+:root[data-injection="held"] .slug { transform: translateX(0); }
+:root[data-injection="live"] .slug { transform: translateX(100%); }
+
+/* knurl — the grip on the actuator */
+.slug i {
+  width: 1px;
+  height: 34%;
+  background: var(--paper);
+  opacity: .45;
+}
+
+.breaker-msg {
+  margin: 1.1rem 0 0;
+  font-size: .8125rem;
+  color: var(--warn);
+  max-width: 56ch;
+}
+
+.breaker-msg[hidden] { display: none; }
+
+/* ── the log ──────────────────────────────────────────────────────────── */
+
+.log { padding-top: 2.25rem; }
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: .9rem;
+  margin-bottom: 1.6rem;
+}
+
+.log-title { margin: 0; color: var(--muted); }
+.log-count { color: var(--muted); white-space: nowrap; }
+.log-count:empty { display: none; }
+
+.empty,
+.notice {
+  margin: 0 0 1.5rem;
+  color: var(--muted);
+  font-size: .875rem;
+  max-width: 52ch;
+}
+
+.notice { color: var(--warn); }
+
+/* ── one entry = one [CMD]/[REPLY] pair, as it reads in the pane ──────── */
+
+.entry { padding-bottom: 2.4rem; }
+
+.tagline {
+  display: flex;
+  align-items: center;
+  gap: .8rem;
+}
+
+.tag {
+  font-size: .8125rem;
+  white-space: nowrap;
+  letter-spacing: .01em;
+}
+
+/* the correlation id is the system's spine, so it is the heaviest thing in
+   the tag — weight, not colour, does the work */
+.t-b  { color: var(--muted); font-weight: 400; }
+.t-k  { color: var(--ink); font-weight: 500; }
+.t-id { color: var(--ink); font-weight: 700; }
+
+.rule {
+  flex: 1 1 1rem;
+  min-width: .75rem;
+  height: 0;
+  border-top: 1px solid var(--rule);
+}
+
+.meta {
+  font-size: .75rem;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.duration:empty { display: none; }
+.status { color: var(--muted); white-space: nowrap; }
+
+.reply-line { margin-top: 1rem; }
+
+.body {
+  margin: .5rem 0 0;
+  padding-left: 1.25ch;
+  border-left: 2px solid var(--rule);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.reply-body {
+  max-height: 22rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.reply-body[hidden] { display: none; }
+
+/* a reply too long for its box keeps a rule under it: the pane continues */
+.reply-body[tabindex] {
+  padding-bottom: .5rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+/* status is the only place colour appears in the log */
+
+.entry[data-status="running"] .status { color: var(--live); }
+.entry[data-status="running"] .cmd-body { border-left-color: var(--live); }
+
+.entry[data-status="timed_out"] .status,
+.entry[data-status="failed"] .status { color: var(--warn); }
+
+/* held: recorded, deliberately not typed. Calm, and visibly a different
+   *kind* of thing from a failure — the tag says HELD instead of REPLY,
+   because no [CMD] and no [REPLY] ever reached the pane, and every rule in
+   the entry goes dotted: an open circuit. */
+
+.entry[data-status="held"] .t-k,
+.entry[data-status="held"] .t-id,
+.entry[data-status="held"] .status { color: var(--muted); }
+
+.entry[data-status="held"] .rule { border-top-style: dashed; }
+.entry[data-status="held"] .body { border-left-style: dotted; }
+.entry[data-status="held"] .reply-body { color: var(--muted); }
+
+/* ── the one motion: a new [CMD-xxxx] types itself in ─────────────────── */
+
+.caret {
+  display: inline-block;
+  width: .55ch;
+  height: 1em;
+  margin-left: .06ch;
+  background: var(--ink);
+  vertical-align: -.13em;
+  animation: blink .9s steps(1, end) infinite;
+}
+
+@keyframes blink {
+  0%, 50%      { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+/* ── narrow ───────────────────────────────────────────────────────────── */
+
+@media (max-width: 46rem) {
+  .breaker {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1.5rem;
+  }
+  .track { width: 100%; }
+}
+
+@media (max-width: 34rem) {
+  :root {
+    --gutter: 1rem;
+    --track-h: 3.5rem;
+  }
+  body { font-size: 13.5px; }
+  .band { padding-top: 1.75rem; padding-bottom: 1.75rem; }
+  .facts { gap: .25rem 1.25rem; }
+  .wordmark { font-size: 1rem; }
+  .feed-word { min-width: 0; }
+  .tagline { gap: .55rem; }
+  .tag { font-size: .75rem; }
+  .meta, .status { font-size: .6875rem; }
+  .log-head { gap: .65rem; }
+  .body { padding-left: 1ch; }
+  .reply-body { max-height: 18rem; }
+}
+
+/* ── reduced motion: state still changes, it just stops moving ────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .dot[data-state="reconnecting"] { opacity: .6; }
+  .caret { display: none; }
+}
