@@ -447,6 +447,25 @@ body {
 .duration:empty { display: none; }
 .status { color: var(--muted); white-space: nowrap; }
 
+/* The way back to the full conversation. Same label type as .status and set
+   in muted ink, so the reply line still reads as one row of metadata rather
+   than sprouting a button — it only comes forward on hover or focus. */
+.open-in {
+  font-family: var(--label);
+  font-size: .6875rem;
+  font-weight: 600;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+  margin-left: .75rem;
+}
+.open-in:hover,
+.open-in:focus-visible { color: var(--ink); }
+.open-in[hidden] { display: none; }
+
 .reply-line { margin-top: 1rem; }
 
 .body {
@@ -479,6 +498,11 @@ body {
 
 .entry[data-status="timed_out"] .status,
 .entry[data-status="failed"] .status { color: var(--warn); }
+
+/* Stopped on purpose in intern. Deliberately NOT the warning colour: nothing
+   went wrong, and a person who pressed stop should not be shown an alarm. */
+.entry[data-status="cancelled"] .status { color: var(--muted); }
+.entry[data-status="cancelled"] .reply-body { color: var(--muted); }
 
 /* held: recorded, deliberately not typed. Calm, and visibly a different
    *kind* of thing from a failure — the tag says HELD instead of REPLY,

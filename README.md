@@ -1,21 +1,54 @@
 # indexd
 
-A webhook for the Pebble Index 01 that injects commands into tmux windows with running agents.
+**A webhook bridge. Not a standalone tool — it needs
+[`internd`](https://github.com/xeb/intern) running alongside it.**
+
+`indexd` is webhooks at both ends and nothing else in between. A webhook comes *in* from the ring's
+phone app; `indexd` submits it to `internd` over HTTP; a webhook comes *back* from `internd` when
+the answer is ready. It owns no agent, no terminal and no model — only the log, the kill switch and
+the console.
 
 You wear the ring. You click and hold its button and speak. Your phone transcribes on-device and
-POSTs the transcript to `indexd`, which types it into a tmux window where you already have an
-interactive CLI agent running, waits for the agent's reply by scraping the pane, and records the
-whole exchange in SQLite. A small private web console shows what you said and what came back, and
-carries a kill switch that stops injection without unhooking the ring.
+POSTs the transcript to `indexd`, which submits it to `internd` as a brand-new project. `internd`
+owns the Claude session, does the typing and the scraping, and pushes the answer back. A small
+private web console shows what you said and what came back, links each command to its full session,
+and carries a kill switch that stops sending without unhooking the ring.
 
-`indexd` is one Rust binary (axum + SQLite, no build step for the console) that binds
-`127.0.0.1:7490` and shells out to `tmux`. It is deliberately agent-neutral: it drives whatever
-interactive agent you run in that window, and everything it needs to know about that agent is
-three config strings.
+`indexd` is one Rust binary (axum + SQLite, no build step for the console). It binds
+`127.0.0.1:7490` for the ring and the console, and `127.0.0.1:7491` for `internd`'s callbacks.
+**It does not touch tmux at all.**
 
-The webhook is fire-and-forget. It inserts a row and returns in milliseconds; it never blocks on
-the agent and never carries the answer back to the ring. The console is where you go to see
-whether the thing you said actually ran.
+### It is tied to internd
+
+This is a hard dependency, not an integration you can swap out. `internd` owns the Claude session,
+the queue, the transcript and the identity a command is sent as; `indexd` contributes the ring's
+words and a place to watch them land. Without `internd` running and holding a matching
+`[[machine_client]]` block, every spoken command fails — reported honestly in the console, with
+`internd`'s own words, rather than hanging.
+
+The coupling is deliberately narrow, and it is entirely over loopback HTTP:
+
+| Direction | What | Where |
+|---|---|---|
+| out | `POST /machine/turns` — submit one command | `internd`, `127.0.0.1:7472` |
+| out | `GET /machine/turns/:id` — reconcile a lost answer | `internd`, `127.0.0.1:7472` |
+| in | `POST /internal/turn-done` — the answer | `indexd`, `127.0.0.1:7491` |
+
+Two shared secrets, one per direction, and a shared understanding of six status words. Nothing else
+crosses.
+
+> **This changed.** `indexd` used to own a tmux window called `index MASTER` — typing
+> `[CMD-<id>][source=index]…` into the pane and scraping `[REPLY-<id>]` back off the screen. That
+> entire mechanism is gone. `internd` was already doing the same screen scraping, with a real
+> queue, streaming, search and a UI over it, so the second copy bought nothing but a second set of
+> the same failure modes and an internet-reachable daemon that could type into a terminal. The
+> hard-won knowledge from that era is preserved under "What driving a pane taught us" below,
+> because it is still true of whatever does the driving. See
+> `docs/superpowers/specs/2026-08-25-indexd-via-intern-design.md`.
+
+The webhook is still fire-and-forget. It inserts a row and returns in milliseconds; it never blocks
+on the answer and never carries one back to the ring. The console is where you go to see whether
+the thing you said actually ran.
 
 ## Architecture
 
@@ -31,38 +64,52 @@ whether the thing you said actually ran.
                              │
               INSERT queued  │  responds "queued <id>" in milliseconds
                              ▼
-                    worker (single, FIFO)      sole owner of the pane
-                             │
-     [CMD-<id>][source=index]… ──send-keys──▶  ┌───────────────────────────┐
-                             │                 │ tmux window "index MASTER"│
-     capture-pane -J, poll for [REPLY-<id>] ◀──│ your interactive agent    │
-                             │                 └───────────────────────────┘
+                  submitter (single, FIFO)     one at a time, so two presses
+                             │                 reach internd in spoken order
+     POST /machine/turns ────┼──────────────▶  ┌───────────────────────────────┐
+                             │                 │ internd (127.0.0.1:7472)      │
+                             │                 │  creates a project            │
+                             │                 │  queues a turn                │
+                             │                 │  drives intern_mark MASTER    │
+     POST /internal/turn-done◀─────────────────│  pushes the outcome           │
+        (127.0.0.1:7491)     │                 └───────────────────────────────┘
+                             │                                 ▲
+                             │        GET /machine/turns/:id   │  the sweeper, every 60s,
+                             │        ─────────────────────────┘  in case a push is lost
                              ▼
-             UPDATE done | timed_out | failed
+             UPDATE done | timed_out | failed | cancelled
                              │
                              └──▶ SQLite ──▶ SSE ──▶ web console + kill switch
 ```
 
-Exactly one worker owns the pane and drains strictly FIFO, so two ring presses can never
-interleave keystrokes into one terminal. Timeouts are generous (90s primary, 600s hard deadline)
-precisely because nothing is blocking on the answer: a slow turn is recorded, not lost.
+Both new ports are loopback and **neither is ever fronted by the tunnel**. That is the whole reason
+the callback route is not just another path on `7490`: your public hostname resolves to a tunnel
+that connects to loopback, so anything mounted on the main router is internet-facing whether it
+looks local or not.
+
+Outcomes arrive twice over, on purpose. The callback is the fast path; the sweeper polls everything
+still in flight every 60 seconds and settles whatever the push missed. `internd`'s dispatcher gives
+up after three attempts and its event bus drops events under lag by design, so a lost callback is a
+question of when, not whether — and settling one command twice is a no-op rather than a race.
 
 ## Requirements
 
 - **Rust**, recent stable (edition 2021; developed on 1.97).
 - **A C compiler.** SQLite is compiled from bundled sources; TLS is rustls, so no OpenSSL.
-- **tmux** (developed against 3.4; needs `capture-pane -J` and `#{pane_in_mode}`).
-- **An interactive CLI agent** you can run in a tmux window, plus the ability to give it standing
-  instructions (a system prompt, a rules file, a project instruction file — whatever it reads).
+- **[`internd`](https://github.com/xeb/intern)**, running on the same host with a `[[machine_client]]`
+  block configured for this daemon. `indexd` has no fallback if it is missing: every spoken command
+  fails, with `internd`'s own explanation, in the console.
 - **A Pebble Index 01** and its phone app, for the intended input path. Anything that can POST
   `multipart/form-data` works just as well — `curl` included.
+
+No tmux. No agent to configure. Those are `internd`'s problem now.
 
 ## Build and install
 
 ```bash
 git clone https://github.com/xeb/indexd
 cd indexd
-cargo test                     # no network, no tmux required — everything is faked
+cargo test                     # no network and no internd required — a stand-in is spawned
 cargo build --release
 install -Dm755 target/release/indexd ~/.local/bin/indexd
 ```
@@ -104,43 +151,42 @@ how you rotate with no downtime: add the new one, change it on the phone, confir
 lands, then drop the old one. An empty list rejects every request and says so loudly at startup —
 there is no configuration that leaves `/hook` open.
 
-Then tell `indexd` about your agent:
+Then wire it to `internd`:
 
 ```toml
-window = "index MASTER"                     # the tmux window it drives
-cwd    = "/absolute/path/to/work/dir"       # cwd for a window it creates (no ~ expansion)
+[intern]
+url   = "http://127.0.0.1:7472"
+token = "Bearer <the same secret as internd's [[machine_client]] token>"
 
-agent_command    = ["my-agent", "--some-non-interactive-flag"]
-streaming_marker = "esc to interrupt"
-dismiss_marker   = "bypass permissions"
+[auth]
+callback_tokens = ["Bearer <a different secret, matching callback_token>"]
 ```
 
-- **`agent_command`** is the argv launched when the target window does not exist. Absent or empty
-  means *never create a window*: `indexd` refuses the turn with an explanation rather than guessing
-  at your agent and launching the wrong process into a terminal. Whatever you name here runs
-  unattended — if your agent stops at a first-run confirmation or a per-action permission prompt,
-  pass whatever flag skips it, because nothing is present to answer one.
-- **`streaming_marker`** is a string your agent's TUI prints for the whole time a turn is in
-  flight and never afterwards. Its *absence* is how a finished turn is detected on the recovery
-  path, so it must be stable text, not a spinner glyph.
-- **`dismiss_marker`**, if present in the pane, is a first-run confirmation that `indexd` dismisses
-  with a single Tab before typing. Set it empty to disable; it only ever fires when the pane
-  actually contains that string.
+These two secrets are **different**, and deliberately so: they are held by different processes in
+opposite directions, and sharing one would mean a leak of either could drive the other's endpoint.
+Both are compared byte for byte against the whole `Authorization` header, in constant time, exactly
+like the ring's tokens.
 
-The defaults for the two markers suit one popular CLI agent. Change them for yours, or watch every
-turn hit the 600-second deadline.
+### Pair it with internd
 
-### Create the window
+`internd` needs the matching half, in `~/.config/internd/config.toml`:
 
-```bash
-export INDEXD_AGENT_COMMAND="my-agent --some-non-interactive-flag"
-bash tools/ensure-window.sh
+```toml
+[[machine_client]]
+name           = "index"
+token          = "Bearer <the same secret as indexd's [intern] token>"
+identity       = "you@example.com"
+callback_url   = "http://127.0.0.1:7491/internal/turn-done"
+callback_token = "Bearer <the same secret as indexd's callback_tokens entry>"
 ```
 
-This is the by-hand version of what the daemon does. It is idempotent, and a window that already
-exists anywhere is left completely alone — never killed, never recreated, never sent anything but
-an existence check. Doing it yourself is the better first move: you get to watch the agent start
-and answer any first-run prompt in person.
+**`identity` is the whole security story.** `indexd` never says whose session a command should
+reach — it cannot, because no machine route reads an identity from a request. The token selects the
+`[[machine_client]]` block, and the block names the identity. The worst a stolen `indexd` token can
+do is act as that one person.
+
+`name` is also what lands in `projects.source`, which is how `internd`'s sidebar marks a spoken
+project with a microphone and how its dispatcher finds its way back here.
 
 ## Run it as a user service
 
@@ -155,9 +201,10 @@ journalctl --user -u indexd.service -f
 
 Two things that catch everyone:
 
-- **PATH.** `tmux` and your agent are both invoked by bare name. A user service gets a minimal
-  PATH that usually contains neither, and the worker then cannot find the window it is supposed to
-  drive.
+- **`internd` has to be running.** `indexd` starting first is survivable — the startup log says so
+  plainly, and each command fails with `internd`'s own words rather than hanging — but nothing will
+  work until it is up. The unit carries `After=internd.service`, not `Requires=`, so an `internd`
+  problem never keeps the console and the log offline too.
 - **Long-running user services need lingering** if you want the daemon up when you are not logged
   in: `sudo loginctl enable-linger $USER`.
 
@@ -246,13 +293,17 @@ curl -sS -X POST http://localhost:7490/hook \
   -F 'client=curl'
 ```
 
-That really does type into your agent's window. It is the fastest way to prove the whole path
-without touching the ring.
+That really does create a session in `internd` and drive the Claude window behind it. It is the
+fastest way to prove the whole path without touching the ring.
 
-## Teach your agent the reply protocol
+## The reply protocol (internd's, not this daemon's)
 
-`indexd` does not talk to your agent over an API. It types into a terminal and reads what comes
-back, so a turn needs a delimiter it can find on a screen full of TUI chrome. It types:
+The tag protocol below is what `internd` speaks to the Claude session. `indexd` no longer sends or
+parses any of it — it posts JSON and reads JSON — but it is documented here because it is what
+ultimately produces the answers this console shows, and because `internd`'s own docs assume you
+already know it.
+
+`internd` types:
 
 ```
 [CMD-<id>][source=index]what you said[/CMD-<id>]
@@ -260,10 +311,14 @@ back, so a turn needs a delimiter it can find on a screen full of TUI chrome. It
 
 and then polls the pane for `[REPLY-<id>]…[/REPLY-<id>]`.
 
-**Your agent has to be told to do this.** Nothing about it is automatic. Without the instruction
-below, the agent answers your question perfectly well in prose, `indexd` never finds a closing tag,
-and every single turn is recorded as `timed_out` after ten minutes. That failure looks like a bug
-in `indexd` and is not one.
+**The session has to be told to do this**, in `~/m/CLAUDE.md`. It already is; nothing about it is
+automatic, and without it a turn is answered perfectly well in prose that no closing tag ever
+terminates.
+
+One difference between a spoken command and a typed one: `internd` omits `[mkdwn=1]` for machine
+clients, which per `~/m/CLAUDE.md` means "format however the message asked". Ring answers come back
+as plain prose, which is what you want on a phone screen and in this console, which renders text
+and nothing else.
 
 Paste this into whatever your agent reads as standing instructions — its system prompt, its rules
 file, its project instruction file:
@@ -373,19 +428,19 @@ because starting with a silently empty token list would take `/hook` down with n
 | `port` | `INDEXD_PORT` | `7490` | Port on `127.0.0.1`. The address is hardcoded loopback. |
 | `data_dir` | `INDEXD_DATA_DIR` | `~/.local/share/indexd` | Holds `indexd.db`. Created if absent. |
 | `static_dir` | `INDEXD_STATIC` | `static` | Console assets. Relative to the working directory. |
-| `window` | `INDEXD_WINDOW` | `index MASTER` | The tmux window driven. Matched exactly, never as a substring. |
-| `cwd` | `INDEXD_CWD` | `$HOME` | Working directory for a window `indexd` creates. No cleverer default is defensible — anything else guesses at your layout. |
-| `agent_command` | `INDEXD_AGENT_COMMAND` | *(empty)* | Argv launched in a window it creates. Empty = never create one. TOML takes an array; the env var is split on whitespace, since a systemd `Environment=` line cannot express a list. |
-| `streaming_marker` | `INDEXD_STREAMING_MARKER` | `esc to interrupt` | Printed by the agent's TUI while a turn is in flight. Its absence means idle. |
-| `dismiss_marker` | `INDEXD_DISMISS_MARKER` | `bypass permissions` | A first-run confirmation to dismiss with Tab. Empty disables it. |
+| `callback_port` | `INDEXD_CALLBACK_PORT` | `7491` | Loopback port for `internd`'s callbacks. Must differ from `port`; equal values are a hard startup error, because the tunnel fronts `port` and this route must never be reachable through it. |
+| `[intern] url` | `INDEXD_INTERN_URL` | `http://127.0.0.1:7472` | `internd`'s machine API. Trailing slash stripped. |
+| `[intern] token` | **none, deliberately** | *(empty — every submission is refused)* | Presented to `internd`; must equal the `token` of a `[[machine_client]]` block there. Trimmed, because a stray space would compare unequal forever with nothing but 401s to show for it. |
+| `[auth] callback_tokens` | **none, deliberately** | *(empty — rejects everything)* | Accepted on the callback listener; must contain `internd`'s `callback_token`. Empty is survivable: pushes are refused and every outcome arrives via the sweeper instead. |
 | `[auth] tokens` | **none, deliberately** | *(empty — rejects everything)* | Full `Authorization` header values accepted at `/hook`. Also read from a top-level `tokens` if you put it there; `[auth]` wins. Secrets stay in the file and out of the process environment. |
 | `[auth] access_aud` | `INDEXD_ACCESS_AUD` | *(none)* | AUD tag of the console's Access application. Unset ⇒ the console fails closed. |
 | `[auth] allowed_emails` | `INDEXD_ALLOWED_EMAILS` | *(empty)* | Console allowlist, lowercased and trimmed. Comma-separated in the environment. Empty ⇒ fails closed. |
 | `[auth] team_domain` | `INDEXD_TEAM_DOMAIN` | *(none)* | e.g. `yourteam.cloudflareaccess.com`. Scheme and trailing slash are stripped, so all three spellings work. Issuer and JWKS URL are derived from it, so they cannot drift apart. |
 | `[auth] allowed_hosts` | `INDEXD_ALLOWED_HOSTS` | `localhost`, `127.0.0.1` | Hostnames this daemon answers for. A request whose `Host` is not listed gets `421 Misdirected Request` before reaching any handler — this is what stops a hostile page from pointing a name it controls at `127.0.0.1` and driving the daemon through your browser. Add your public hostname when serving through a tunnel. An empty list disables the check. |
-| `[timeouts] primary_secs` | none | `90` | First wait. Crossing it is logged, not fatal. |
-| `[timeouts] extended_secs` | none | `600` | Hard deadline from submission. Crossing it records `timed_out`. |
-| `[timeouts] poll_interval_ms` | none | `200` | How often the pane is re-read. |
+| `[timeouts] intern_secs` | none | `15` | Ceiling on one HTTP call to `internd`. A guard against a hung socket, not a real deadline — the call only queues work. |
+| `[timeouts] sweep_interval_secs` | none | `60` | How often everything in flight is reconciled, and therefore the worst-case delay of a lost callback. |
+| `[timeouts] submit_timeout_secs` | none | `60` | Give up on a command that never reached `internd` at all. |
+| `[timeouts] stale_after_secs` | none | `3600` | Give up on a `running` command while `internd` is unreachable. Only ever reached when it is down: for as long as it answers, its own status is believed however long the turn takes — a turn that genuinely runs for two hours is not a timeout. |
 | — | `RUST_LOG` | `indexd=info` | Standard `tracing-subscriber` filter. |
 
 A blank environment variable reads as *unset*, not as an empty value: a half-filled unit file with
@@ -394,28 +449,51 @@ of failing somewhere that points at the wrong thing.
 
 ### Routes
 
+On `127.0.0.1:7490` — the listener the tunnel fronts:
+
 | Route | Gate |
 |---|---|
 | `GET /health` | open — the only one, and it reports nothing but liveness |
 | `POST /hook` | bearer token list |
 | `GET /` | console gate |
-| `GET /api/info` | console gate — window, cwd, injection state |
+| `GET /api/info` | console gate — `internd`'s URL, injection state |
 | `GET /api/commands?limit=` | console gate — most recent first, default 100, clamped to 1–1000 |
 | `GET /api/events` | console gate — SSE stream of upserts |
 | `POST /api/injection` | console gate — the kill switch |
 
+On `127.0.0.1:7491` — never fronted by the tunnel:
+
+| Route | Gate |
+|---|---|
+| `GET /health` | open |
+| `POST /internal/turn-done` | `callback_tokens` list |
+
+A test asserts that `/internal/turn-done` is **not** reachable on the main router, because nothing
+in the callback listener's own tests would notice if it were quietly mounted on both.
+
 ### Command lifecycle
 
-`queued → running → done | timed_out | failed`, plus `held` for anything that arrived while the
-kill switch was off. Those six words are identical in the database, the JSON API, and the console.
+`queued → running → done | timed_out | failed | cancelled`, plus `held` for anything that arrived
+while the kill switch was off. Those seven words are identical in the database, the JSON API, and
+the console.
+
+`running` now means "accepted by `internd`", and the row carries the project and turn ids it came
+back with plus the link `internd` built. `cancelled` is new and exists so the console can say
+*stopped* rather than *failed* when someone presses stop in the web app — nothing went wrong, and
+a status that implied otherwise would be a small lie repeated every time you looked at the log.
+
 A restart mid-turn would otherwise strand rows claiming to be `queued` or `running` forever, so at
-startup they are settled to `failed` with the error `interrupted by a restart` — the console never
-shows a turn that cannot finish.
+startup they are settled to `failed` with the error `interrupted by a restart`. That stays a
+blanket failure rather than an attempt to re-adopt in-flight turns from `internd` — the turn ids
+are in the database now, so it could be done, but an answer that arrived during the seconds we were
+down is better reported as interrupted than silently resurrected minutes later.
 
-## tmux gotchas
+## What driving a pane taught us
 
-Everything in this section was learned the hard way. If you are writing something else that drives
-a terminal agent, this is the part worth stealing.
+**None of this is `indexd`'s code any more** — `internd` does the driving, and this repo no longer
+shells out to `tmux` at all. It is kept because every item is still true of whatever drives a
+terminal agent, and because each one was learned by hitting it. If you are writing something else
+that drives a terminal agent, this is the part worth stealing.
 
 - **`capture-pane -J` is load-bearing.** Without `-J`, wrapped lines are captured as separate rows,
   and a `[/REPLY-<id>]` closer that happens to land on a column boundary is split across two of
@@ -471,28 +549,45 @@ only" or "Both".
 **The test button says 200 but nothing runs.** Correct. Test events are acknowledged and dropped
 on purpose — see "Point the ring at it".
 
-**Every turn ends as `timed_out`, but the agent clearly answered.** The agent has not been told the
-reply protocol, or was told and is not following it. Attach to the window and look: prose with no
-`[REPLY-<id>]` tags is this exact failure. See "Teach your agent the reply protocol".
+**Every command fails with `internd refused the command: 401`.** `[intern] token` here and the
+`token` in `internd`'s `[[machine_client]]` block do not match. Both are the *whole* `Authorization`
+header value, scheme included — `Bearer abc` and `abc` are different secrets.
 
-**Turns time out after an agent upgrade.** The TUI text moved. `streaming_marker` is the usual
-culprit — if the new version no longer prints that phrase while working, idle detection thinks
-every frame is idle. Attach, look at what it prints during a turn, update the marker.
+**Every command fails with `no Claude session is configured for this identity`.** The `identity` in
+that `[[machine_client]]` block has no `[[window]]` entry in `internd`'s config. `internd` refuses
+to route it into someone else's session rather than guess, which is the correct answer.
 
-**`could not ensure window … no agent_command is configured`.** The target window does not exist
-and `indexd` will not guess what to launch. Either create it yourself with
-`tools/ensure-window.sh`, or set `agent_command`.
+**Commands go to `failed` immediately with a connection error.** `internd` is not listening on
+`[intern] url`. Check `systemctl --user status internd` and `internd`'s own `machine_port`; the
+startup log here says which URL was tried.
 
-**`tmux new-window` fails with "index 0 in use".** A `-t` target lost its trailing colon. See the
-tmux gotchas.
+**Answers arrive, but always about a minute late.** The callback is being refused and everything is
+coming from the sweeper instead. Check that `callback_tokens` here contains `internd`'s
+`callback_token`, and look for `machine: … refused the callback … 401` in `internd`'s journal.
 
-**The command went into the wrong window.** Check for a second window whose name is a prefix of
-yours. Matching is exact by design; if a local change ever loosened it to a substring test, that is
-the bug.
+**The daemon seems to have stopped saving anything.** Check for a WAL you detached by accident:
 
-**Keystrokes vanish with no error.** The pane is in copy-mode (or the ready check is racing a
-still-booting agent). `indexd` cancels the mode before typing; if you are driving tmux from
-somewhere else too, that is where to look.
+```bash
+ls -l /proc/$(systemctl --user show -p MainPID --value indexd.service)/fd | grep indexd.db
+```
+
+Any `(deleted)` next to `indexd.db-wal` means a read-write `sqlite3` CLI connection checkpointed
+and unlinked the WAL out from under the running daemon. It keeps writing through the deleted
+inode, so its writes are invisible to every other reader and the next restart discards them
+silently. Restart the daemon to recover — and always read a live database with
+`sqlite3 -readonly`, which never does this. Both daemons on this box are WAL-mode and both are
+equally exposed; this cost a row during the 2026-08-25 deploy.
+
+**A command sits `running` forever.** It should not be possible: the sweeper settles anything
+`internd` can be asked about, and times out anything it cannot after `stale_after_secs`. If one
+does, check that the row has a `turn_id` (`sqlite3 ~/.local/share/indexd/indexd.db 'select
+id,status,turn_id from commands where status="running"'`) — a `running` row with no `turn_id` is
+the one state nothing can reconcile, and it means `mark_submitted` lost a race worth investigating.
+
+**Turns fail after an upgrade to `internd`.** A status word it grew that this build does not
+recognise is deliberately never coerced into an outcome — the log says
+`which this build does not understand`, and the command stays honestly in flight. Add the status to
+`intern::map_status`.
 
 **The queue looks stuck.** One worker owns the pane and drains FIFO, so a long turn blocks
 everything behind it until it finishes or hits the 600s deadline. Attach to the window and see what
@@ -525,9 +620,10 @@ Things this shape of daemon invites, none of which are built:
 - **Other trigger sources.** `/hook` is a small multipart endpoint, and everything funnels through
   one `accept()` that owns the kill-switch decision. A Shortcuts action, a Stream Deck key, a
   desk button, an SMS bridge, or a cron job would all be a handler and a route.
-- **Other agents.** The three knobs (`agent_command`, `streaming_marker`, `dismiss_marker`) are the
-  whole agent-specific surface. A `[[agent]]` table of known presets would spare everyone the
-  discovery step.
+- **Continuing a spoken thread.** Every press makes a fresh project, so a follow-up like "no, the
+  other one" has no context — `internd` builds no `[recap=]` for a project with no history. Reusing
+  the previous ring project within a few minutes would fix it, at the cost of a rule ("which
+  session am I talking into?") that is invisible from the ring itself.
 - **Replaying a held command.** `held` is terminal today, deliberately — but "re-run these three
   things I said while injection was off" is an obvious console button, and the row already holds
   everything needed.
@@ -536,8 +632,9 @@ Things this shape of daemon invites, none of which are built:
 - **Richer console.** Search across the transcript, filter by status, day grouping, an export, a
   copy-reply button. The data model already carries created/started/finished timestamps that
   nothing currently plots.
-- **Multiple windows.** One worker per window, chosen by a form field or a trigger header, so a
-  double-click-hold could reach a different agent than a single click.
+- **Multiple identities.** `internd` selects the identity from the token, so a second
+  `[[machine_client]]` and a second `[intern]` token would let a double-click-hold reach a
+  different person's session than a single click.
 - **Speak the answer back.** Nothing returns the reply to the phone today. The row is there; a
   polling endpoint keyed by command id would be a small addition, and a notification would be a
   better one.

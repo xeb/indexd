@@ -19,14 +19,18 @@ use std::path::PathBuf;
 /// Verified free on this box (§1).
 pub const DEFAULT_PORT: u16 = 7490;
 
-/// The one window `indexd` drives. Auto-created in [`default_cwd`] if
-/// absent (§8).
-pub const DEFAULT_WINDOW: &str = "index MASTER";
+/// Loopback port the callback listener binds.
+///
+/// A **second** listener, separate from [`DEFAULT_PORT`], and never fronted by
+/// the tunnel — the same reasoning as `internd`'s machine port. Your public
+/// hostname resolves to the tunnel, which connects to loopback, so a callback
+/// route on the main port would be reachable from the internet with nothing
+/// but a bearer token in front of it.
+pub const DEFAULT_CALLBACK_PORT: u16 = 7491;
 
-/// `$HOME/m` — the same working directory intern's windows use (§1).
-/// Working directory for a window this daemon creates. `$HOME` is the only
-/// defensible default: anything else is a guess about someone else's layout.
-pub const DEFAULT_CWD_SUFFIX: &str = "";
+/// Where `internd`'s machine API listens. Loopback: the two daemons run on
+/// the same box, and this API is deliberately not exposed anywhere else.
+pub const DEFAULT_INTERN_URL: &str = "http://127.0.0.1:7472";
 
 /// The console is for exactly one person (§9). This is the in-process copy of
 /// the Cloudflare Access policy, so an edit at the edge cannot quietly widen
@@ -49,15 +53,31 @@ pub const DEFAULT_TEAM_DOMAIN: &str = "";
 /// tunnel or proxy, or requests arriving with that `Host` are refused.
 pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
 
-/// First wait for `[REPLY-id]` (§7).
-pub const DEFAULT_PRIMARY_TIMEOUT_SECS: u64 = 90;
+/// How long one HTTP call to `internd` may take. Generous for a loopback
+/// round trip that only queues work, so this is really a guard against a
+/// hung socket rather than a real deadline.
+pub const DEFAULT_INTERN_TIMEOUT_SECS: u64 = 15;
 
-/// The extended wait a still-working turn is granted before it is recorded as
-/// `timed_out`. `run_agent` already returned, so a slow turn costs nothing.
-pub const DEFAULT_EXTENDED_TIMEOUT_SECS: u64 = 600;
+/// How often the sweeper reconciles everything in flight.
+///
+/// Also the worst-case delay a lost callback costs: the sweeper polls every
+/// running command on every pass, so an answer that never got pushed still
+/// lands within one interval.
+pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 60;
 
-/// `capture-pane` cadence (§7, Part II §II.4).
-pub const DEFAULT_POLL_INTERVAL_MS: u64 = 200;
+/// How long a command may sit `queued` — never handed to `internd` at all —
+/// before it is failed. Only reached if the submitter died or its channel
+/// overflowed; a healthy submit is a loopback round trip.
+pub const DEFAULT_SUBMIT_TIMEOUT_SECS: u64 = 60;
+
+/// How long a `running` command whose turn `internd` cannot be asked about is
+/// given before it is recorded as `timed_out`.
+///
+/// Only reached while `internd` is unreachable. For as long as it answers, its
+/// own status is believed however long the turn takes — a turn that genuinely
+/// runs for two hours is not a timeout, and guessing otherwise would put a
+/// wrong answer in the log.
+pub const DEFAULT_STALE_AFTER_SECS: u64 = 3600;
 
 /// The database file inside `data_dir`.
 pub const DB_FILENAME: &str = "indexd.db";
@@ -68,21 +88,26 @@ pub const DB_FILENAME: &str = "indexd.db";
 #[serde(default)]
 pub struct FileConfig {
     pub port: Option<u16>,
+    pub callback_port: Option<u16>,
     pub data_dir: Option<PathBuf>,
     pub static_dir: Option<PathBuf>,
-    pub window: Option<String>,
-    pub cwd: Option<PathBuf>,
     /// Accepted at the top level as well as under `[auth]` so a token list
     /// written in the obvious place is never silently ignored — an ignored
     /// list means an empty list, which means `/hook` rejects everything.
     pub tokens: Option<Vec<String>>,
-    /// Launched in a window this daemon creates. Empty/absent = never create
-    /// one; `indexd` refuses with an explanation instead of guessing.
-    pub agent_command: Option<Vec<String>>,
-    pub streaming_marker: Option<String>,
-    pub dismiss_marker: Option<String>,
     pub auth: AuthSection,
+    pub intern: InternSection,
     pub timeouts: TimeoutSection,
+}
+
+/// `[intern]` — where commands go now that this daemon drives no pane.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct InternSection {
+    pub url: Option<String>,
+    /// The whole `Authorization` header value `internd` compares against its
+    /// own `[[machine_client]]` list — scheme included.
+    pub token: Option<String>,
 }
 
 /// `[auth]` — the two postures of §9 in one place.
@@ -97,15 +122,22 @@ pub struct AuthSection {
     pub allowed_emails: Option<Vec<String>>,
     pub team_domain: Option<String>,
     pub allowed_hosts: Option<Vec<String>>,
+    /// Full `Authorization` header values accepted on the callback listener.
+    ///
+    /// A **separate** list from `tokens`: the ring's token and `internd`'s are
+    /// different secrets held by different processes, and sharing one would
+    /// mean a leak from either could drive the other's endpoint.
+    pub callback_tokens: Option<Vec<String>>,
 }
 
 /// `[timeouts]` — the waits and the poll cadence, in the units their names say.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TimeoutSection {
-    pub primary_secs: Option<u64>,
-    pub extended_secs: Option<u64>,
-    pub poll_interval_ms: Option<u64>,
+    pub intern_secs: Option<u64>,
+    pub sweep_interval_secs: Option<u64>,
+    pub submit_timeout_secs: Option<u64>,
+    pub stale_after_secs: Option<u64>,
 }
 
 /// Everything the daemon needs, already resolved. No `Option` survives here
@@ -115,33 +147,35 @@ pub struct TimeoutSection {
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
+    /// Loopback port for the callback listener. See [`DEFAULT_CALLBACK_PORT`].
+    pub callback_port: u16,
     pub data_dir: PathBuf,
     pub static_dir: PathBuf,
-    /// tmux window name, compared exactly after the first colon (§7).
-    pub window: String,
-    /// Working directory for the window when it has to be created (§8).
-    pub cwd: PathBuf,
     /// Full `Authorization` header values accepted at `/hook`. Empty means
     /// reject everything — see [`Config::tokens_configured`].
     pub tokens: Vec<String>,
+    /// Full `Authorization` header values accepted on the callback listener.
+    /// Empty means reject everything, which costs nothing but timeliness: the
+    /// sweeper still settles every command by polling.
+    pub callback_tokens: Vec<String>,
     pub access_aud: Option<String>,
     /// Lowercased and trimmed, to match the normalized email out of the
     /// Access assertion.
     pub allowed_emails: Vec<String>,
-    /// Argv launched in a window this daemon creates.
-    pub agent_command: Vec<String>,
-    /// What the agent's TUI prints while a turn is in flight.
-    pub streaming_marker: String,
-    /// A first-run confirmation to dismiss with Tab. Empty disables it.
-    pub dismiss_marker: String,
+    /// Base URL of `internd`'s machine API, no trailing slash.
+    pub intern_url: String,
+    /// Presented to `internd` on every call. Empty means every submission is
+    /// refused with a `401` — loud in the log and visible in the console.
+    pub intern_token: String,
     /// Bare host, no scheme, no trailing slash — `issuer` and `jwks_url` build
     /// the URLs from it.
     pub team_domain: String,
     /// Lowercased and trimmed.
     pub allowed_hosts: Vec<String>,
-    pub primary_timeout_secs: u64,
-    pub extended_timeout_secs: u64,
-    pub poll_interval_ms: u64,
+    pub intern_timeout_secs: u64,
+    pub sweep_interval_secs: u64,
+    pub submit_timeout_secs: u64,
+    pub stale_after_secs: u64,
 }
 
 /// Hand-written rather than derived so that `tracing::info!("{config:?}")` at
@@ -154,17 +188,19 @@ impl std::fmt::Debug for Config {
             .field("port", &self.port)
             .field("data_dir", &self.data_dir)
             .field("static_dir", &self.static_dir)
-            .field("window", &self.window)
-            .field("cwd", &self.cwd)
+            .field("callback_port", &self.callback_port)
             .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
+            .field("callback_tokens", &format_args!("<{} redacted>", self.callback_tokens.len()))
             .field("access_aud", &self.access_aud)
             .field("allowed_emails", &self.allowed_emails)
-            .field("agent_command", &self.agent_command)
+            .field("intern_url", &self.intern_url)
+            .field("intern_token", &format_args!("<{}>", if self.intern_token.is_empty() { "unset" } else { "redacted" }))
             .field("team_domain", &self.team_domain)
             .field("allowed_hosts", &self.allowed_hosts)
-            .field("primary_timeout_secs", &self.primary_timeout_secs)
-            .field("extended_timeout_secs", &self.extended_timeout_secs)
-            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("intern_timeout_secs", &self.intern_timeout_secs)
+            .field("sweep_interval_secs", &self.sweep_interval_secs)
+            .field("submit_timeout_secs", &self.submit_timeout_secs)
+            .field("stale_after_secs", &self.stale_after_secs)
             .finish()
     }
 }
@@ -186,15 +222,6 @@ pub fn default_config_path() -> PathBuf {
 /// mount where `chmod` reports success and silently no-ops.
 pub fn default_data_dir() -> PathBuf {
     home().join(".local/share/indexd")
-}
-
-/// `$HOME/m`, the cwd the window is created in.
-pub fn default_cwd() -> PathBuf {
-    if DEFAULT_CWD_SUFFIX.is_empty() {
-        home()
-    } else {
-        home().join(DEFAULT_CWD_SUFFIX)
-    }
 }
 
 /// An environment variable, treating blank as absent.
@@ -286,12 +313,22 @@ impl Config {
             None => file.port.unwrap_or(DEFAULT_PORT),
         };
 
+        let callback_port = match env.then(|| env_str("INDEXD_CALLBACK_PORT")).flatten() {
+            Some(v) => v
+                .parse()
+                .with_context(|| format!("INDEXD_CALLBACK_PORT={v} is not a port number"))?,
+            None => file.callback_port.unwrap_or(DEFAULT_CALLBACK_PORT),
+        };
+        if callback_port == port {
+            anyhow::bail!(
+                "callback_port ({callback_port}) is the same as port — the callback listener \
+                 must have its own, because the one on {port} is the one the tunnel fronts"
+            );
+        }
+
         let data_dir = pick_path("INDEXD_DATA_DIR", file.data_dir).unwrap_or_else(default_data_dir);
         let static_dir =
             pick_path("INDEXD_STATIC", file.static_dir).unwrap_or_else(|| PathBuf::from("static"));
-        let window = pick_str("INDEXD_WINDOW", file.window)
-            .unwrap_or_else(|| DEFAULT_WINDOW.to_string());
-        let cwd = pick_path("INDEXD_CWD", file.cwd).unwrap_or_else(default_cwd);
 
         // `[auth] tokens` wins over a top-level `tokens`; both are read so a
         // list written in either place still gates the endpoint. The values
@@ -306,7 +343,19 @@ impl Config {
                 .map(String::as_str),
         );
 
+        let callback_tokens =
+            clean_list(file.auth.callback_tokens.unwrap_or_default().iter().map(String::as_str));
+
         let access_aud = pick_str("INDEXD_ACCESS_AUD", file.auth.access_aud);
+
+        let intern_url = pick_str("INDEXD_INTERN_URL", file.intern.url)
+            .unwrap_or_else(|| DEFAULT_INTERN_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        // Deliberately file-only, like the `/hook` tokens: this is the secret
+        // that lets a process drive a Claude session, and keeping it out of
+        // the environment keeps it out of `systemctl show`.
+        let intern_token = file.intern.token.unwrap_or_default().trim().to_string();
 
         let allowed_emails = lowercase_list(
             pick_list("INDEXD_ALLOWED_EMAILS", file.auth.allowed_emails)
@@ -325,36 +374,30 @@ impl Config {
 
         Ok(Config {
             port,
+            callback_port,
             data_dir,
             static_dir,
-            window,
-            cwd,
             tokens,
+            callback_tokens,
             access_aud,
             allowed_emails,
-            // Space-separated in the environment (systemd Environment= cannot
-            // express a list); a proper array in TOML.
-            agent_command: std::env::var("INDEXD_AGENT_COMMAND")
-                .ok()
-                .map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-                .filter(|v: &Vec<String>| !v.is_empty())
-                .or(file.agent_command)
-                .unwrap_or_default(),
-            streaming_marker: pick_str("INDEXD_STREAMING_MARKER", file.streaming_marker)
-                .unwrap_or_else(|| crate::tmux::extract::STREAMING_MARKER.to_string()),
-            dismiss_marker: pick_str("INDEXD_DISMISS_MARKER", file.dismiss_marker)
-                .unwrap_or_else(|| crate::tmux::extract::DEFAULT_DISMISS_MARKER.to_string()),
+            intern_url,
+            intern_token,
             team_domain,
             allowed_hosts,
-            primary_timeout_secs: file
+            intern_timeout_secs: file
                 .timeouts
-                .primary_secs
-                .unwrap_or(DEFAULT_PRIMARY_TIMEOUT_SECS),
-            extended_timeout_secs: file
+                .intern_secs
+                .unwrap_or(DEFAULT_INTERN_TIMEOUT_SECS),
+            sweep_interval_secs: file
                 .timeouts
-                .extended_secs
-                .unwrap_or(DEFAULT_EXTENDED_TIMEOUT_SECS),
-            poll_interval_ms: file.timeouts.poll_interval_ms.unwrap_or(DEFAULT_POLL_INTERVAL_MS),
+                .sweep_interval_secs
+                .unwrap_or(DEFAULT_SWEEP_INTERVAL_SECS),
+            submit_timeout_secs: file
+                .timeouts
+                .submit_timeout_secs
+                .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_SECS),
+            stale_after_secs: file.timeouts.stale_after_secs.unwrap_or(DEFAULT_STALE_AFTER_SECS),
         })
     }
 
@@ -372,6 +415,26 @@ impl Config {
     /// boots and tells you what to put in the file.
     pub fn tokens_configured(&self) -> bool {
         !self.tokens.is_empty()
+    }
+
+    /// Is there a token to present to `internd`?
+    ///
+    /// `false` is loadable for the same reason an empty `/hook` list is: the
+    /// daemon boots, `main` says loudly what is missing, and every submission
+    /// fails with `internd`'s own `401` in the console rather than the whole
+    /// box refusing to start.
+    pub fn intern_configured(&self) -> bool {
+        !self.intern_token.is_empty()
+    }
+
+    /// Timeouts, in the shape the sweeper wants them.
+    pub fn sweep_config(&self) -> crate::worker::SweepConfig {
+        use std::time::Duration;
+        crate::worker::SweepConfig {
+            interval: Duration::from_secs(self.sweep_interval_secs),
+            submit_timeout: Duration::from_secs(self.submit_timeout_secs),
+            stale_after: Duration::from_secs(self.stale_after_secs),
+        }
     }
 
     /// Expected `iss` on a `Cf-Access-Jwt-Assertion`, and the origin its JWKS
@@ -409,8 +472,8 @@ mod tests {
             "INDEXD_PORT",
             "INDEXD_DATA_DIR",
             "INDEXD_STATIC",
-            "INDEXD_WINDOW",
-            "INDEXD_CWD",
+            "INDEXD_CALLBACK_PORT",
+            "INDEXD_INTERN_URL",
             "INDEXD_ALLOWED_EMAILS",
             "INDEXD_ACCESS_AUD",
             "INDEXD_TEAM_DOMAIN",
@@ -431,38 +494,53 @@ mod tests {
         assert_eq!(c.port, 7490);
         assert_eq!(c.data_dir, home().join(".local/share/indexd"));
         assert_eq!(c.static_dir, PathBuf::from("static"));
-        assert_eq!(c.window, "index MASTER");
-        assert_eq!(c.cwd, home(), "no default beyond $HOME — anything else guesses at someone's layout");
+        assert_eq!(c.callback_port, 7491, "its own port, never the one the tunnel fronts");
+        assert_eq!(c.intern_url, "http://127.0.0.1:7472");
+        assert!(c.intern_token.is_empty(), "no default token; submissions fail closed until set");
+        assert!(!c.intern_configured());
         assert!(c.tokens.is_empty(), "no tokens is loadable, just closed");
+        assert!(c.callback_tokens.is_empty(), "same posture as the ring's tokens");
         assert!(!c.tokens_configured());
         assert_eq!(c.access_aud, None, "a missing AUD must stay visible so auth fails closed");
         assert!(c.allowed_emails.is_empty(), "no default identity; the console fails closed until configured");
         assert_eq!(c.team_domain, "", "deployment-specific; no default");
         assert_eq!(c.allowed_hosts, vec!["localhost", "127.0.0.1"], "loopback only until a public host is named");
-        assert_eq!(c.primary_timeout_secs, 90);
-        assert_eq!(c.extended_timeout_secs, 600);
-        assert_eq!(c.poll_interval_ms, 200);
+        assert_eq!(c.intern_timeout_secs, 15);
+        assert_eq!(c.sweep_interval_secs, 60);
+        assert_eq!(c.submit_timeout_secs, 60);
+        assert_eq!(c.stale_after_secs, 3600);
+    }
+
+    /// Two listeners on one port would mean the callback route was reachable
+    /// through the tunnel, which is the one thing its own port exists to
+    /// prevent. Refuse to start rather than serve that quietly.
+    #[test]
+    fn a_callback_port_equal_to_the_main_port_is_refused() {
+        let err = Config::from_toml_str("port = 7490\ncallback_port = 7490\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("callback_port"), "{msg}");
     }
 
     #[test]
     fn an_empty_document_is_all_defaults() {
         let c = Config::from_toml_str("").unwrap();
         assert_eq!(c.port, DEFAULT_PORT);
-        assert_eq!(c.window, DEFAULT_WINDOW);
+        assert_eq!(c.callback_port, DEFAULT_CALLBACK_PORT);
+        assert_eq!(c.intern_url, DEFAULT_INTERN_URL);
         assert!(c.allowed_emails.is_empty(), "no default identity; the console fails closed until configured");
         assert!(c.tokens.is_empty());
     }
 
     #[test]
     fn a_partial_file_changes_only_what_it_names() {
-        let c = Config::from_toml_str("port = 9001\nwindow = \"other MASTER\"\n").unwrap();
+        let c = Config::from_toml_str("port = 9001\n\n[intern]\nurl = \"http://127.0.0.1:9472\"\n").unwrap();
         assert_eq!(c.port, 9001);
-        assert_eq!(c.window, "other MASTER");
+        assert_eq!(c.intern_url, "http://127.0.0.1:9472");
         // Everything unmentioned still holds its default.
         assert_eq!(c.static_dir, PathBuf::from("static"));
-        assert_eq!(c.cwd, home(), "no default beyond $HOME — anything else guesses at someone's layout");
+        assert_eq!(c.callback_port, DEFAULT_CALLBACK_PORT);
         assert_eq!(c.allowed_hosts, vec!["localhost", "127.0.0.1"], "loopback only until a public host is named");
-        assert_eq!(c.extended_timeout_secs, 600);
+        assert_eq!(c.stale_after_secs, 3600);
     }
 
     #[test]
@@ -470,22 +548,27 @@ mod tests {
         let c = Config::from_toml_str(
             r#"
 port = 7777
+callback_port = 7791
 data_dir = "/var/lib/indexd"
 static_dir = "/srv/indexd/static"
-window = "index TEST"
-cwd = "/srv/agent"
+
+[intern]
+url = "http://127.0.0.1:8472/"
+token = "  Bearer machine-secret  "
 
 [auth]
 tokens = ["Bearer primary", "Bearer spare"]
+callback_tokens = ["Bearer callback"]
 access_aud = "deadbeef"
 allowed_emails = ["Someone@Example.COM ", " ", "other@example.com"]
 team_domain = "https://example.cloudflareaccess.com/"
 allowed_hosts = ["Console.Example.COM", "localhost"]
 
 [timeouts]
-primary_secs = 30
-extended_secs = 120
-poll_interval_ms = 50
+intern_secs = 5
+sweep_interval_secs = 10
+submit_timeout_secs = 20
+stale_after_secs = 30
 "#,
         )
         .unwrap();
@@ -493,9 +576,15 @@ poll_interval_ms = 50
         assert_eq!(c.port, 7777);
         assert_eq!(c.data_dir, PathBuf::from("/var/lib/indexd"));
         assert_eq!(c.static_dir, PathBuf::from("/srv/indexd/static"));
-        assert_eq!(c.window, "index TEST");
-        assert_eq!(c.cwd, PathBuf::from("/srv/agent"));
+        assert_eq!(c.callback_port, 7791);
+        // Trailing slash stripped, so every URL this builds has exactly one.
+        assert_eq!(c.intern_url, "http://127.0.0.1:8472");
+        // Trimmed: a stray space would compare unequal to internd's configured
+        // token forever, with nothing but 401s to show for it.
+        assert_eq!(c.intern_token, "Bearer machine-secret");
+        assert!(c.intern_configured());
         assert_eq!(c.tokens, vec!["Bearer primary", "Bearer spare"]);
+        assert_eq!(c.callback_tokens, vec!["Bearer callback"]);
         assert!(c.tokens_configured());
         assert_eq!(c.access_aud.as_deref(), Some("deadbeef"));
         // Lowercased, trimmed, blanks dropped — so a mixed-case entry still
@@ -507,9 +596,30 @@ poll_interval_ms = 50
         assert_eq!(c.issuer(), "https://example.cloudflareaccess.com");
         assert_eq!(c.jwks_url(), "https://example.cloudflareaccess.com/cdn-cgi/access/certs");
         assert_eq!(c.allowed_hosts, vec!["console.example.com", "localhost"]);
-        assert_eq!(c.primary_timeout_secs, 30);
-        assert_eq!(c.extended_timeout_secs, 120);
-        assert_eq!(c.poll_interval_ms, 50);
+        assert_eq!(c.intern_timeout_secs, 5);
+        assert_eq!(c.sweep_interval_secs, 10);
+        assert_eq!(c.submit_timeout_secs, 20);
+        assert_eq!(c.stale_after_secs, 30);
+    }
+
+    /// The ring's token and internd's are different secrets held by different
+    /// processes. Sharing one list would mean a leak of either could drive the
+    /// other's endpoint, so they are deliberately not merged and neither
+    /// falls back to the other.
+    #[test]
+    fn the_hook_and_callback_token_lists_are_separate() {
+        let c = Config::from_toml_str(
+            "[auth]\ntokens = [\"Bearer ring\"]\ncallback_tokens = [\"Bearer internd\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.tokens, vec!["Bearer ring"]);
+        assert_eq!(c.callback_tokens, vec!["Bearer internd"]);
+
+        let only_hook = Config::from_toml_str("[auth]\ntokens = [\"Bearer ring\"]\n").unwrap();
+        assert!(
+            only_hook.callback_tokens.is_empty(),
+            "the ring's token must never become a callback token by default"
+        );
     }
 
     /// The spec writes the token list under `[auth]`; a top-level `tokens`
@@ -550,11 +660,11 @@ poll_interval_ms = 50
         let _g = env_lock();
         clear_env();
         std::env::set_var("INDEXD_PORT", "8123");
-        std::env::set_var("INDEXD_WINDOW", "from env MASTER");
+        std::env::set_var("INDEXD_INTERN_URL", "http://127.0.0.1:9999");
         let c = Config::from_toml_str("port = 9001").unwrap();
         clear_env();
         assert_eq!(c.port, 9001, "from_toml_str is the file's meaning alone");
-        assert_eq!(c.window, DEFAULT_WINDOW);
+        assert_eq!(c.intern_url, DEFAULT_INTERN_URL);
     }
 
     #[test]
@@ -569,8 +679,10 @@ poll_interval_ms = 50
 port = 9001
 data_dir = "/from/file/data"
 static_dir = "/from/file/static"
-window = "file MASTER"
-cwd = "/from/file/cwd"
+
+[intern]
+url = "http://127.0.0.1:1111"
+token = "Bearer machine-from-file"
 
 [auth]
 tokens = ["Bearer from-file"]
@@ -586,8 +698,7 @@ allowed_hosts = ["file.example.com"]
         std::env::set_var("INDEXD_PORT", "8123");
         std::env::set_var("INDEXD_DATA_DIR", "/from/env/data");
         std::env::set_var("INDEXD_STATIC", "/from/env/static");
-        std::env::set_var("INDEXD_WINDOW", "env MASTER");
-        std::env::set_var("INDEXD_CWD", "/from/env/cwd");
+        std::env::set_var("INDEXD_INTERN_URL", "http://127.0.0.1:2222");
         std::env::set_var("INDEXD_ALLOWED_EMAILS", " Env@Example.com , second@example.com ,");
         std::env::set_var("INDEXD_ACCESS_AUD", "env-aud");
         std::env::set_var("INDEXD_TEAM_DOMAIN", "env.cloudflareaccess.com");
@@ -599,15 +710,15 @@ allowed_hosts = ["file.example.com"]
         assert_eq!(c.port, 8123);
         assert_eq!(c.data_dir, PathBuf::from("/from/env/data"));
         assert_eq!(c.static_dir, PathBuf::from("/from/env/static"));
-        assert_eq!(c.window, "env MASTER");
-        assert_eq!(c.cwd, PathBuf::from("/from/env/cwd"));
+        assert_eq!(c.intern_url, "http://127.0.0.1:2222");
         assert_eq!(c.access_aud.as_deref(), Some("env-aud"));
         assert_eq!(c.allowed_emails, vec!["env@example.com", "second@example.com"]);
         assert_eq!(c.team_domain, "env.cloudflareaccess.com");
         assert_eq!(c.allowed_hosts, vec!["env.example.com", "127.0.0.1"]);
-        // There is no environment override for the tokens — secrets stay in
+        // There is no environment override for either secret — they stay in
         // the file, out of `systemctl show` and the process environment.
         assert_eq!(c.tokens, vec!["Bearer from-file"]);
+        assert_eq!(c.intern_token, "Bearer machine-from-file");
     }
 
     #[test]
@@ -616,13 +727,14 @@ allowed_hosts = ["file.example.com"]
         clear_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "port = 9001\nwindow = \"file MASTER\"\n").unwrap();
+        std::fs::write(&path, "port = 9001\n\n[intern]\nurl = \"http://127.0.0.1:1111\"\n")
+            .unwrap();
         std::env::set_var("INDEXD_CONFIG", &path);
         std::env::set_var("INDEXD_PORT", "8123");
         let c = Config::load().unwrap();
         clear_env();
         assert_eq!(c.port, 8123, "env wins where it speaks");
-        assert_eq!(c.window, "file MASTER", "and the file where it does not");
+        assert_eq!(c.intern_url, "http://127.0.0.1:1111", "and the file where it does not");
     }
 
     /// `Environment=INDEXD_ACCESS_AUD=` in a half-filled unit file must land
@@ -633,11 +745,11 @@ allowed_hosts = ["file.example.com"]
         clear_env();
         std::env::set_var("INDEXD_CONFIG", "/nonexistent/indexd/config.toml");
         std::env::set_var("INDEXD_ACCESS_AUD", "   ");
-        std::env::set_var("INDEXD_WINDOW", "");
+        std::env::set_var("INDEXD_INTERN_URL", "");
         let c = Config::load().unwrap();
         clear_env();
         assert_eq!(c.access_aud, None);
-        assert_eq!(c.window, DEFAULT_WINDOW);
+        assert_eq!(c.intern_url, DEFAULT_INTERN_URL);
     }
 
     #[test]
@@ -677,7 +789,15 @@ allowed_hosts = ["file.example.com"]
         assert!(!printed.contains("spare"), "{printed}");
         assert!(printed.contains("<2 redacted>"), "{printed}");
         assert!(printed.contains("deadbeef"), "the AUD is not a secret: {printed}");
-        assert!(printed.contains("index MASTER"), "{printed}");
+        assert!(printed.contains("http://127.0.0.1:7472"), "{printed}");
+        // The internd token is the other secret in this file and gets the same
+        // treatment — including the fact that "unset" is worth seeing.
+        assert!(printed.contains("intern_token: <unset>"), "{printed}");
+        let with_token =
+            Config::from_toml_str("[intern]\ntoken = \"Bearer m4ch1ne\"\n").unwrap();
+        let printed = format!("{with_token:?}");
+        assert!(!printed.contains("m4ch1ne"), "{printed}");
+        assert!(printed.contains("intern_token: <redacted>"), "{printed}");
     }
 
     #[test]

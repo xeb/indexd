@@ -2,7 +2,7 @@
 name = "indexd"
 version = "0.1.0"
 edition = "2021"
-description = "A webhook for the Pebble Index 01 that injects commands into tmux windows with running agents"
+description = "A webhook bridge from the Pebble Index 01 ring to internd, which owns the agent session"
 
 [lib]
 name = "indexd"

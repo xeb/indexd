@@ -10,9 +10,14 @@
 # tokens live in the config file, which is not readable from `systemctl show`.
 
 [Unit]
-Description=indexd — Pebble Index 01 webhook -> tmux agent window
-After=network-online.target
+Description=indexd — Pebble Index 01 webhook -> a project in internd
+After=network-online.target internd.service
 Wants=network-online.target
+# Not `Requires=`: indexd starting while internd is down is a survivable state
+# it reports honestly (the startup log says so, and each command fails with
+# internd's own words) rather than a reason to refuse to start. `After=` only
+# orders them when both are being started together.
+After=internd.service
 
 [Service]
 Type=simple
@@ -26,24 +31,12 @@ Environment=INDEXD_DATA_DIR=%h/.local/share/indexd
 Environment=INDEXD_STATIC=%h/src/indexd/static
 Environment=RUST_LOG=indexd=info
 
-# The tmux window this drives, and where a window it creates should start.
-#
-# NOTE THE QUOTES. systemd splits `Environment=` on whitespace, so an unquoted
-#   Environment=INDEXD_WINDOW=index MASTER
-# silently sets INDEXD_WINDOW to just "index" — and if a window by that shorter
-# name happens to exist, the daemon will type into it instead. Quote any value
-# containing a space, and check `systemctl --user show indexd -p Environment`
-# after editing; the daemon also logs the window it resolved at startup.
-Environment="INDEXD_WINDOW=index MASTER"
-Environment=INDEXD_CWD=%h
+# Where internd's machine API listens, and the loopback port this daemon binds
+# for internd's callbacks. Both default correctly; set them only if you moved
+# one. The tokens for both live in the config file, never here.
+# Environment=INDEXD_INTERN_URL=http://127.0.0.1:7472
+# Environment=INDEXD_CALLBACK_PORT=7491
 
-# Argv launched when the window is missing. Leave unset and indexd will refuse
-# to create a window rather than guess at your agent — create it yourself with
-# tools/ensure-window.sh instead. Whatever you put here runs unattended, so it
-# must not stop at an interactive confirmation; nothing is there to answer it.
-# Environment="INDEXD_AGENT_COMMAND=my-agent --some-non-interactive-flag"
-
-# `tmux` and your agent are both invoked by bare name, so both must be on PATH.
 # systemd gives a user service a minimal PATH, which is usually not enough.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=%h

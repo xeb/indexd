@@ -2,6 +2,7 @@
 //! gate; `/health` and the `hook` submodule are mounted separately in
 //! `build_router` with their own posture.
 
+pub mod callback;
 pub mod hook;
 
 use axum::extract::{Query, State};
@@ -31,8 +32,7 @@ pub async fn health() -> &'static str {
 /// What this daemon is wired to. Read by the console masthead.
 pub async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
-        "window": state.window,
-        "cwd": state.cwd,
+        "intern_url": state.intern_url,
         "injecting": state.db.injecting().unwrap_or(true),
     }))
 }
@@ -112,16 +112,20 @@ mod tests {
     async fn state() -> AppState {
         let db = Db::open_in_memory().unwrap();
         let hub = Hub::new();
-        let worker = crate::worker::spawn(
-            db.clone(),
-            hub.clone(),
-            crate::tmux::EngineConfig::default(),
-        );
+        // A client pointed at a port nothing is listening on: these tests
+        // exercise the console's own handlers, and a submitter that cannot
+        // reach internd is exactly as useful for that as one that can.
+        let intern = crate::intern::Intern::new(
+            "http://127.0.0.1:1",
+            "Bearer test",
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let worker = crate::worker::spawn(db.clone(), hub.clone(), intern);
         AppState {
             db,
             hub,
-            window: "index MASTER".into(),
-            cwd: "/srv/agent".into(),
+            intern_url: "http://127.0.0.1:7472".into(),
             static_dir: "static".into(),
             worker,
         }
@@ -135,8 +139,7 @@ mod tests {
         let st = state().await;
 
         let Json(v) = info(State(st.clone())).await;
-        assert_eq!(v["window"], "index MASTER");
-        assert_eq!(v["cwd"], "/srv/agent");
+        assert_eq!(v["intern_url"], "http://127.0.0.1:7472");
         assert_eq!(v["injecting"], true, "absent or wrong => console shows ---- and refuses to post");
 
         st.db.set_injecting(false).unwrap();

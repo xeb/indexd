@@ -34,10 +34,13 @@ use std::sync::{Arc, Mutex};
 /// reconcile test asserts on it.
 pub const STRANDED_ERROR: &str = "interrupted by a restart";
 
-/// The schema, exactly as ORIGINAL_SPEC §6 states it.
+/// The schema.
 ///
-/// `IF NOT EXISTS` throughout, so `open` is idempotent and needs no migration
-/// machinery — this is a single table that has only ever had one shape.
+/// `IF NOT EXISTS` throughout, so `open` is idempotent. `project_id` and
+/// `turn_id` were added when `indexd` stopped driving a tmux pane and began
+/// submitting to `internd` instead; both are nullable and both are added to
+/// an existing database by [`ensure_intern_columns`], so there is still no
+/// migration machinery to speak of and no version stamp to keep in step.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS commands (
   id          TEXT PRIMARY KEY,
@@ -47,7 +50,10 @@ CREATE TABLE IF NOT EXISTS commands (
   error       TEXT,
   created_at  INTEGER NOT NULL,
   started_at  INTEGER,
-  finished_at INTEGER
+  finished_at INTEGER,
+  project_id  TEXT,
+  turn_id     TEXT,
+  project_url TEXT
 );
 CREATE INDEX IF NOT EXISTS commands_created_idx ON commands(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings (
@@ -71,11 +77,18 @@ pub enum Status {
     Done,
     TimedOut,
     Failed,
-    /// Arrived while the kill switch was off: kept in the log, never typed into
-    /// the pane. Terminal — flipping the switch back on does NOT replay held
-    /// commands, because dumping a backlog of stale requests into a live
-    /// session is worse than losing them.
+    /// Arrived while the kill switch was off: kept in the log, never sent.
+    /// Terminal — flipping the switch back on does NOT replay held commands,
+    /// because dumping a backlog of stale requests into a live session is
+    /// worse than losing them.
     Held,
+    /// Stopped in `internd` before it finished — someone pressed stop in the
+    /// web app, or the turn was cancelled out from under us.
+    ///
+    /// Distinct from `failed` on purpose: nothing went wrong, and showing
+    /// "failed" for a turn a person deliberately stopped would be a small
+    /// lie the console repeats every time you look at it.
+    Cancelled,
 }
 
 impl Status {
@@ -89,6 +102,7 @@ impl Status {
             Status::TimedOut => "timed_out",
             Status::Failed => "failed",
             Status::Held => "held",
+            Status::Cancelled => "cancelled",
         }
     }
 
@@ -104,6 +118,7 @@ impl Status {
             "timed_out" => Some(Status::TimedOut),
             "failed" => Some(Status::Failed),
             "held" => Some(Status::Held),
+            "cancelled" => Some(Status::Cancelled),
             _ => None,
         }
     }
@@ -112,7 +127,10 @@ impl Status {
     /// can strand; everything else is settled forever.
     pub fn is_terminal(&self) -> bool {
         // Held counts: nothing further will happen to it.
-        matches!(self, Status::Done | Status::TimedOut | Status::Failed | Status::Held)
+        matches!(
+            self,
+            Status::Done | Status::TimedOut | Status::Failed | Status::Held | Status::Cancelled
+        )
     }
 }
 
@@ -143,11 +161,26 @@ pub struct Command {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// The `internd` project this command became, once it has been submitted.
+    /// `None` while `queued`, and on anything `held` or failed before it ever
+    /// reached `internd`. The console turns it into a link.
+    pub project_id: Option<String>,
+    /// The `internd` turn inside that project. Also the key the callback
+    /// arrives under, and what the sweeper polls with.
+    pub turn_id: Option<String>,
+    /// The clickable link, exactly as `internd` built it from its own
+    /// `public_base_url`.
+    ///
+    /// Stored rather than assembled here on purpose: `indexd` would otherwise
+    /// need its own copy of whatever hostname fronts `internd`, and two
+    /// configs naming the same hostname is two chances to be wrong. What is
+    /// recorded is what `internd` actually said at the time.
+    pub project_url: Option<String>,
 }
 
 /// A status string in the database that this binary has no variant for.
 #[derive(Debug, thiserror::Error)]
-#[error("commands.status = {0:?} is not one of queued|running|done|timed_out|failed")]
+#[error("commands.status = {0:?} is not one of queued|running|done|timed_out|failed|held|cancelled")]
 struct UnknownStatus(String);
 
 /// The command log. Cheap to clone — the clone shares the connection.
@@ -157,7 +190,8 @@ pub struct Db {
 }
 
 /// Every SELECT below asks for these columns in this order.
-const COLUMNS: &str = "id, text, status, reply, error, created_at, started_at, finished_at";
+const COLUMNS: &str = "id, text, status, reply, error, created_at, started_at, finished_at, \
+                       project_id, turn_id, project_url";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
     let raw: String = r.get("status")?;
@@ -177,6 +211,9 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
         created_at: r.get("created_at")?,
         started_at: r.get("started_at")?,
         finished_at: r.get("finished_at")?,
+        project_id: r.get("project_id")?,
+        turn_id: r.get("turn_id")?,
+        project_url: r.get("project_url")?,
     })
 }
 
@@ -192,6 +229,41 @@ fn prepare(conn: &Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL").context("PRAGMA journal_mode")?;
     conn.pragma_update(None, "busy_timeout", 5000).context("PRAGMA busy_timeout")?;
     conn.execute_batch(SCHEMA).context("applying the commands schema")?;
+    ensure_intern_columns(conn).context("adding the internd id columns")?;
+    Ok(())
+}
+
+/// Add `project_id`/`turn_id`/`project_url` to a database created before
+/// `indexd` routed through `internd`, and the index over `turn_id`.
+///
+/// Keyed off `PRAGMA table_info` rather than a version stamp: all three columns
+/// are nullable with no default, so `ADD COLUMN` is not a table rewrite, there
+/// is nothing to back up, and an older binary reads such a database perfectly
+/// well (it simply never selects them). That is why this needs none of the
+/// ceremony `internd`'s migrations carry.
+///
+/// **The index belongs here and not in [`SCHEMA`].** On an existing database
+/// `CREATE TABLE IF NOT EXISTS commands` is a no-op, so a
+/// `CREATE INDEX … ON commands(turn_id)` sitting in that batch runs against
+/// the *old* table and fails with `no such column: turn_id` — the whole
+/// statement batch aborts and the daemon will not start. A fresh database
+/// hides this completely, because there the `CREATE TABLE` really does create
+/// the column first. That is exactly what happened on the first deploy of this
+/// change, and it is why `an_existing_database_gains_the_intern_columns`
+/// starts from the pre-change table definition rather than from `open`.
+fn ensure_intern_columns(conn: &Connection) -> anyhow::Result<()> {
+    let existing: Vec<String> = {
+        let mut q = conn.prepare("PRAGMA table_info(commands)")?;
+        let rows = q.query_map([], |r| r.get::<_, String>(1))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    for column in ["project_id", "turn_id", "project_url"] {
+        if !existing.iter().any(|e| e == column) {
+            tracing::info!("db: adding commands.{column}");
+            conn.execute_batch(&format!("ALTER TABLE commands ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS commands_turn_idx ON commands(turn_id);")?;
     Ok(())
 }
 
@@ -242,25 +314,94 @@ impl Db {
         Ok(())
     }
 
-    /// The worker has the pane and is about to type this command in.
+    /// `internd` accepted this command: record the ids it came back with and
+    /// move the row to `running`.
     ///
-    /// Only a `queued` row moves — re-running this against a row that has
+    /// The ids are written in the same statement as the status, not before
+    /// it, so there is no instant where a row is `running` with nothing to
+    /// poll — which is the one state the sweeper could not act on.
+    ///
+    /// Only a `queued` row moves. Re-running this against a row that has
     /// already finished (or been settled by [`Db::reconcile_stranded`]) would
     /// otherwise resurrect it as `running` and leave the console showing a
-    /// turn nothing will ever complete.
-    pub fn mark_running(&self, id: &str, now: i64) -> anyhow::Result<()> {
+    /// turn nothing will ever complete. That is not hypothetical here: a
+    /// callback can arrive before this update lands, since `internd` answers
+    /// the submit and pushes the outcome over two independent connections.
+    pub fn mark_submitted(
+        &self,
+        id: &str,
+        project_id: &str,
+        turn_id: &str,
+        project_url: Option<&str>,
+        now: i64,
+    ) -> anyhow::Result<()> {
         let n = self
             .conn()
             .execute(
-                "UPDATE commands SET status = ?2, started_at = ?3
+                "UPDATE commands
+                    SET status = ?2, started_at = ?3, project_id = ?4, turn_id = ?5,
+                        project_url = ?6
                   WHERE id = ?1 AND status = 'queued'",
-                rusqlite::params![id, Status::Running, now],
+                rusqlite::params![id, Status::Running, now, project_id, turn_id, project_url],
             )
-            .with_context(|| format!("starting command {id}"))?;
+            .with_context(|| format!("submitting command {id}"))?;
         if n == 0 {
-            tracing::warn!("db: {id} was not queued when the worker picked it up; not started");
+            // Losing the ids here would strand the row: the sweeper polls by
+            // `turn_id`, so a finished-early row with none can never be
+            // reconciled. Write them without touching the status.
+            tracing::warn!(
+                "db: {id} was not queued when internd accepted it (a callback probably \
+                 arrived first); recording the ids without changing its status"
+            );
+            self.conn()
+                .execute(
+                    "UPDATE commands SET project_id = ?2, turn_id = ?3, project_url = ?4
+                      WHERE id = ?1",
+                    rusqlite::params![id, project_id, turn_id, project_url],
+                )
+                .with_context(|| format!("recording internd ids for {id}"))?;
         }
         Ok(())
+    }
+
+    /// The command a callback is about to settle, found by the `internd` turn
+    /// it names.
+    ///
+    /// `turn_id` is not unique in the schema — nothing stops two rows from
+    /// carrying one if something upstream went badly wrong — so this takes
+    /// the newest and says so, rather than silently picking whichever the
+    /// query planner returned first.
+    pub fn by_turn_id(&self, turn_id: &str) -> anyhow::Result<Option<Command>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM commands WHERE turn_id = ?1
+              ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        );
+        let got = self
+            .conn()
+            .query_row(&sql, rusqlite::params![turn_id], row)
+            .optional()
+            .with_context(|| format!("reading the command for turn {turn_id}"))?;
+        Ok(got)
+    }
+
+    /// Everything still in flight, oldest first — what the sweeper walks.
+    ///
+    /// Both non-terminal states are returned, because they need opposite
+    /// treatment and only the caller knows the deadlines: a `running` row has
+    /// a `turn_id` to poll `internd` with, while a `queued` one never reached
+    /// `internd` at all and can only be aged out.
+    pub fn unsettled(&self) -> anyhow::Result<Vec<Command>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM commands
+              WHERE status IN ('queued', 'running')
+              ORDER BY created_at ASC, rowid ASC"
+        );
+        let conn = self.conn();
+        let mut q = conn.prepare(&sql).context("preparing the unsettled-commands query")?;
+        let rows = q.query_map([], row).context("listing unsettled commands")?;
+        let out =
+            rows.collect::<rusqlite::Result<Vec<_>>>().context("reading unsettled commands")?;
+        Ok(out)
     }
 
     /// Settle a command in a terminal state (Part II §II.7).
@@ -507,7 +648,7 @@ mod tests {
             db.insert(&id, "what's on my calendar tomorrow", 100).unwrap();
             assert_eq!(db.get(&id).unwrap().unwrap().status, Status::Queued);
 
-            db.mark_running(&id, 101).unwrap();
+            db.mark_submitted(&id, "p-id", "t-id", None, 101).unwrap();
             let running = db.get(&id).unwrap().unwrap();
             assert_eq!(running.status, Status::Running);
             assert_eq!(running.started_at, Some(101));
@@ -528,7 +669,7 @@ mod tests {
     fn finish_clears_a_stale_error_when_it_writes_a_reply() {
         let db = db();
         db.insert("a1b2", "x", 1).unwrap();
-        db.mark_running("a1b2", 2).unwrap();
+        db.mark_submitted("a1b2", "p-a1b2", "t-a1b2", None, 2).unwrap();
         db.finish("a1b2", Status::Failed, None, Some("tmux went away"), 3).unwrap();
         db.finish("a1b2", Status::Done, Some("the answer"), None, 4).unwrap();
         let c = db.get("a1b2").unwrap().unwrap();
@@ -539,17 +680,17 @@ mod tests {
 
     /// A row that is no longer `queued` must not be dragged back into flight.
     #[test]
-    fn mark_running_only_moves_a_queued_row() {
+    fn mark_submitted_only_moves_a_queued_row() {
         let db = db();
         db.insert("a1b2", "x", 1).unwrap();
         db.finish("a1b2", Status::Done, Some("answered"), None, 2).unwrap();
-        db.mark_running("a1b2", 3).unwrap();
+        db.mark_submitted("a1b2", "p-a1b2", "t-a1b2", None, 3).unwrap();
         let c = db.get("a1b2").unwrap().unwrap();
         assert_eq!(c.status, Status::Done, "a finished command stays finished");
         assert_eq!(c.started_at, None);
 
         // An id that does not exist at all is a no-op, not an error.
-        db.mark_running("zzzz", 4).unwrap();
+        db.mark_submitted("zzzz", "p-zzzz", "t-zzzz", None, 4).unwrap();
     }
 
     #[test]
@@ -592,7 +733,7 @@ mod tests {
         db.insert("cccc", "middle", 20).unwrap();
         db.insert("dddd", "in flight", 40).unwrap();
         db.insert("eeee", "answered", 50).unwrap();
-        db.mark_running("dddd", 41).unwrap();
+        db.mark_submitted("dddd", "p-dddd", "t-dddd", None, 41).unwrap();
         db.finish("eeee", Status::Done, Some("yes"), None, 51).unwrap();
 
         let ids: Vec<String> = db.pending().unwrap().into_iter().map(|c| c.id).collect();
@@ -608,7 +749,7 @@ mod tests {
         let db = db();
         db.insert("qqqq", "never started", 10).unwrap();
         db.insert("rrrr", "cut off mid-turn", 20).unwrap();
-        db.mark_running("rrrr", 21).unwrap();
+        db.mark_submitted("rrrr", "p-rrrr", "t-rrrr", None, 21).unwrap();
         db.insert("dddd", "already answered", 30).unwrap();
         db.finish("dddd", Status::Done, Some("the answer"), None, 31).unwrap();
         db.insert("ffff", "already failed", 40).unwrap();
@@ -684,6 +825,69 @@ mod tests {
         assert_eq!(fk, 1);
     }
 
+    /// Open a database with the table exactly as it was before `indexd`
+    /// routed through `internd`, and require that it comes up.
+    ///
+    /// This is not a hypothetical. The first deploy of this change crash-looped
+    /// on precisely this path: the `turn_id` index was declared inside
+    /// `SCHEMA`, where `CREATE TABLE IF NOT EXISTS` is a no-op against an
+    /// existing table, so the index ran before the column existed and the whole
+    /// batch aborted with `no such column: turn_id`. Every test at the time
+    /// passed, because they all started from a fresh database where the
+    /// `CREATE TABLE` genuinely creates the column first.
+    ///
+    /// So this one starts from the old shape on disk, with a real row in it.
+    #[test]
+    fn an_existing_database_gains_the_intern_columns() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("indexd.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                r#"
+CREATE TABLE commands (
+  id          TEXT PRIMARY KEY,
+  text        TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  reply       TEXT,
+  error       TEXT,
+  created_at  INTEGER NOT NULL,
+  started_at  INTEGER,
+  finished_at INTEGER
+);
+CREATE INDEX commands_created_idx ON commands(created_at DESC);
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO commands (id, text, status, reply, created_at, started_at, finished_at)
+  VALUES ('a1b2', 'is the spa on', 'done', 'Yes.', 100, 101, 130);
+INSERT INTO settings (key, value) VALUES ('injecting', '0');
+"#,
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).expect("an existing database must still open");
+
+        // The history survived, including its reply and its kill-switch state.
+        let c = db.get("a1b2").unwrap().unwrap();
+        assert_eq!(c.status, Status::Done);
+        assert_eq!(c.reply.as_deref(), Some("Yes."));
+        assert_eq!(c.project_id, None, "a command from before the change has no project");
+        assert_eq!(c.turn_id, None);
+        assert_eq!(c.project_url, None);
+        assert!(!db.injecting().unwrap(), "the kill switch must survive too");
+
+        // And the new columns are usable, not merely present.
+        db.insert("c3d4", "and the sauna", 200).unwrap();
+        db.mark_submitted("c3d4", "proj-9", "turn-9", Some("https://x/s/proj-9"), 201).unwrap();
+        assert_eq!(db.by_turn_id("turn-9").unwrap().unwrap().id, "c3d4");
+
+        // Idempotent: a second open must not fail or duplicate anything.
+        drop(db);
+        let again = Db::open(&path).expect("reopening must be a no-op");
+        assert_eq!(again.by_turn_id("turn-9").unwrap().unwrap().id, "c3d4");
+        assert_eq!(again.recent(10).unwrap().len(), 2);
+    }
+
     #[test]
     fn the_schema_matches_the_spec() {
         let db = db();
@@ -708,6 +912,11 @@ mod tests {
                 ("created_at", "INTEGER", true),
                 ("started_at", "INTEGER", false),
                 ("finished_at", "INTEGER", false),
+                // Added when indexd stopped driving a pane. Nullable, because
+                // a held command never reaches internd and so never has them.
+                ("project_id", "TEXT", false),
+                ("turn_id", "TEXT", false),
+                ("project_url", "TEXT", false),
             ]
         );
 
@@ -739,7 +948,7 @@ mod tests {
     fn a_command_serializes_with_the_field_names_the_console_expects() {
         let db = db();
         db.insert("a1b2", "hello", 1000).unwrap();
-        db.mark_running("a1b2", 1001).unwrap();
+        db.mark_submitted("a1b2", "p-a1b2", "t-a1b2", None, 1001).unwrap();
         db.finish("a1b2", Status::TimedOut, None, None, 1601).unwrap();
         let json = serde_json::to_value(db.get("a1b2").unwrap().unwrap()).unwrap();
         assert_eq!(json["id"], "a1b2");

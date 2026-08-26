@@ -1,19 +1,31 @@
-//! indexd — Pebble Index 01 ring -> a tmux window running an agent.
+//! indexd — Pebble Index 01 ring -> a project in `internd`.
 //!
-//! Flow: the ring POSTs a transcript to `/hook`, which inserts a row and returns
-//! immediately; a single
-//! FIFO worker owns the tmux pane, injects `[CMD-id][source=index]...`, scrapes
-//! `[REPLY-id]`, and records the outcome for the console at your console hostname.
+//! Flow: the ring POSTs a transcript to `/hook`, which inserts a row and
+//! returns immediately; a single-consumer submitter POSTs it to `internd`'s
+//! machine API, which creates a project, queues a turn, and drives
+//! `intern_mark MASTER` itself; the outcome comes back over a callback on this
+//! daemon's second loopback listener, with a sweeper polling as the backstop.
 //!
-//! See ORIGINAL_SPEC.md. Part II governs `tmux::extract` — read it before
-//! touching the parser.
+//! **This daemon no longer touches tmux at all.** It used to own
+//! `index MASTER` — typing `[CMD-id][source=index]…` into the pane and
+//! scraping `[REPLY-id]` back off the screen — and the entire `src/tmux`
+//! module went with that job. `internd` was already doing the same screen
+//! scraping, better and with a queue and a UI over it, so the second copy was
+//! only ever a second set of the same failure modes plus a daemon reachable
+//! from the internet that could type into a terminal. `index MASTER` is left
+//! running and untouched.
+//!
+//! See `docs/superpowers/specs/2026-08-25-indexd-via-intern-design.md`.
+//! ORIGINAL_SPEC.md describes the tmux-driving design this replaced; it is
+//! history now, not a contract.
 
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod events;
+pub mod ids;
+pub mod intern;
 pub mod routes;
-pub mod tmux;
 pub mod worker;
 
 use std::sync::Arc;
@@ -136,14 +148,33 @@ fn asset_tag(path: &std::path::Path) -> String {
 pub struct AppState {
     pub db: Db,
     pub hub: Hub,
-    /// The tmux window and cwd this daemon actually drives. The console shows
-    /// these; without them it can only hardcode a guess, which silently
-    /// becomes a lie the first time config changes.
-    pub window: String,
-    pub cwd: String,
+    /// Where this daemon sends commands. The console shows it; without it the
+    /// page can only hardcode a guess, which silently becomes a lie the first
+    /// time config changes.
+    pub intern_url: String,
     pub static_dir: String,
-    /// Lets `/hook` enqueue work for the pane owner.
+    /// Lets `/hook` hand work to the submitter.
     pub worker: crate::worker::WorkerHandle,
+}
+
+/// The callback listener: one route, its own token gate, its own port.
+///
+/// Deliberately a separate router from [`build_router`] rather than another
+/// route on it. your public hostname resolves to a tunnel that connects to loopback,
+/// so anything mounted there is internet-reachable; this is not, because the
+/// tunnel never maps the port it binds. See `routes::callback`'s module doc.
+///
+/// `/health` is mounted outside the token layer so the listener can be probed
+/// without a token, the same way `internd`'s machine API can — and, as on the
+/// main router, it is the only route here that does not carry the gate.
+pub fn build_callback_router(state: AppState, cfg: &Config) -> Router {
+    let tokens = Arc::new(cfg.callback_tokens.clone());
+    Router::new()
+        .route("/internal/turn-done", post(routes::callback::turn_done))
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(tokens, require_token))
+        .route("/health", get(routes::health))
+        .layer(axum::middleware::from_fn(log_requests))
 }
 
 /// Assemble the whole surface.

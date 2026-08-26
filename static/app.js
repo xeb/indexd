@@ -2,14 +2,15 @@
    Vanilla JS, no build step, no frameworks, no external requests.
 
    Contract:
-     GET  /api/info                  -> {window, cwd, injecting}
+     GET  /api/info                  -> {intern_url, injecting}
      GET  /api/commands?limit=100    -> {"commands":[Command, ...]}  newest first
      POST /api/injection {enabled}   -> {"injecting": bool}
      GET  /api/events                -> SSE
         {"type":"command","command":{...}}   upsert by id
         {"type":"injection","enabled":bool}  the breaker moved somewhere else
 
-   Command = {id, text, status, reply, error, created_at, started_at, finished_at}
+   Command = {id, text, status, reply, error, created_at, started_at, finished_at,
+               project_id, turn_id, project_url}
      status      queued | running | done | timed_out | failed | held
      timestamps  unix seconds; reply/error/started_at/finished_at may be null
 
@@ -26,7 +27,6 @@
 
   var MAX_ENTRIES = 100;
   var RECONNECT_MAX = 15000;
-  var DEFAULT_WINDOW = 'index MASTER';
 
   var reduceMotion = window.matchMedia
     ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -40,8 +40,7 @@
     feedWord: document.getElementById('link-word'),
     host: document.getElementById('host'),
     port: document.getElementById('port'),
-    windowName: document.getElementById('window'),
-    cwd: document.getElementById('cwd'),
+    internUrl: document.getElementById('intern'),
     announcer: document.getElementById('announcer'),
     breaker: document.getElementById('breaker'),
     breakerWord: document.getElementById('breaker-word'),
@@ -66,7 +65,10 @@
 
   var injecting = null;      // true | false | null (not yet known)
   var postSeq = 0;
-  var paneName = DEFAULT_WINDOW;
+  /* What the log calls the far end. Not the URL: the URL is loopback and
+     means nothing to a reader, while "intern" is the thing they actually
+     know. The masthead shows the URL for when it does matter. */
+  var DESTINATION = 'intern';
 
   /* ── formatting ─────────────────────────────────────────────────────── */
 
@@ -76,7 +78,8 @@
     done: 'done',
     timed_out: 'timed out',
     failed: 'failed',
-    held: 'held'
+    held: 'held',
+    cancelled: 'stopped'
   };
 
   function statusWord(status) {
@@ -123,13 +126,15 @@
       case 'done':
         return (cmd.reply && cmd.reply.trim())
           ? cmd.reply
-          : 'Finished with no reply body. Read the turn in ' + paneName + '.';
+          : 'Finished with no reply body. Open the session in ' + DESTINATION + '.';
       case 'timed_out':
-        return 'Still running in ' + paneName + '.';
+        return 'Lost track of this one. Open the session in ' + DESTINATION + '.';
       case 'failed':
         return (cmd.error && cmd.error.trim())
           ? cmd.error
-          : 'Failed with no detail recorded. Read the turn in ' + paneName + '.';
+          : 'Failed with no detail recorded. Open the session in ' + DESTINATION + '.';
+      case 'cancelled':
+        return 'Stopped in ' + DESTINATION + ' before it finished.';
       case 'held':
         return 'Held — injection is off.';
       default:
@@ -137,8 +142,8 @@
     }
   }
 
-  /* Nothing was typed into the pane for a held request, so there is no
-     [CMD]/[REPLY] pair to mirror. The second tag says so. */
+  /* Nothing was sent for a held request, so there is no [CMD]/[REPLY] pair to
+     mirror. The second tag says so. */
   function replyKeyword(status) {
     return status === 'held' ? 'HELD' : 'REPLY';
   }
@@ -157,7 +162,11 @@
       error: typeof raw.error === 'string' ? raw.error : null,
       created_at: num(raw.created_at),
       started_at: num(raw.started_at),
-      finished_at: num(raw.finished_at)
+      finished_at: num(raw.finished_at),
+      /* Built by internd from its own public base URL and stored verbatim, so
+         this page never needs its own copy of that hostname. Absent on
+         anything held or failed before it was ever accepted. */
+      project_url: typeof raw.project_url === 'string' ? raw.project_url : null
     };
   }
 
@@ -208,10 +217,20 @@
     duration.className = 'meta duration';
     var status = document.createElement('span');
     status.className = 'status';
+    /* The way back to the full conversation. Hidden until internd has
+       actually accepted the command and told us where it landed — a link to
+       a session that does not exist yet is worse than no link. */
+    var open = document.createElement('a');
+    open.className = 'open-in';
+    open.textContent = 'open';
+    open.rel = 'noopener noreferrer';
+    open.target = '_blank';
+    open.hidden = true;
     replyLine.appendChild(replyTag.node);
     replyLine.appendChild(span('rule', ''));
     replyLine.appendChild(duration);
     replyLine.appendChild(status);
+    replyLine.appendChild(open);
 
     var replyBody = document.createElement('div');
     replyBody.className = 'body reply-body';
@@ -230,6 +249,7 @@
       replyKw: replyTag.kw,
       duration: duration,
       status: status,
+      open: open,
       replyBody: replyBody,
       raf: 0,
       watchdog: 0,
@@ -256,6 +276,19 @@
     rec.replyKw.textContent = replyKeyword(cmd.status);
     rec.status.textContent = statusWord(cmd.status);
     rec.duration.textContent = durationText(cmd);
+
+    /* Only ever an absolute https URL from internd. Assigning a string the
+       daemon gave us to `href` would otherwise happily accept a
+       `javascript:` scheme, and this page renders a log of text that came in
+       over a webhook. */
+    if (cmd.project_url && /^https?:\/\//i.test(cmd.project_url)) {
+      rec.open.href = cmd.project_url;
+      rec.open.setAttribute('aria-label', 'open command ' + cmd.id + ' in ' + DESTINATION);
+      rec.open.hidden = false;
+    } else {
+      rec.open.removeAttribute('href');
+      rec.open.hidden = true;
+    }
 
     var body = replyBodyText(cmd);
     if (body === null) {
@@ -517,12 +550,12 @@
       return;
     }
     if (on) {
-      node.appendChild(document.createTextNode('Speech is typed straight into '));
-      node.appendChild(span('w', paneName));
+      node.appendChild(document.createTextNode('Speech becomes a session in '));
+      node.appendChild(span('w', DESTINATION));
       node.appendChild(document.createTextNode('.'));
     } else {
       node.appendChild(document.createTextNode(
-        'Requests still land and are logged. Nothing is typed.'));
+        'Requests still land and are logged. Nothing is sent.'));
     }
   }
 
@@ -555,8 +588,8 @@
 
     if (changed) {
       announce(value
-        ? 'injection live: speech is typed into ' + paneName
-        : 'injection held: nothing is typed');
+        ? 'injection live: speech becomes a session in ' + DESTINATION
+        : 'injection held: nothing is sent');
     }
   }
 
@@ -642,9 +675,9 @@
     });
   }
 
-  /* The window, cwd and breaker position are the daemon's, not the page's.
-     The markup carries sensible defaults so nothing is ever blank, but
-     /api/info is the only thing that actually knows. */
+  /* Where commands go, and the breaker position, are the daemon's facts and
+     not the page's. The markup carries sensible defaults so nothing is ever
+     blank, but /api/info is the only thing that actually knows. */
   function loadInfo() {
     return fetch('/api/info', {
       cache: 'no-store',
@@ -655,12 +688,8 @@
       return r.json();
     }).then(function (info) {
       if (!info) return;
-      if (info.window) {
-        paneName = String(info.window);
-        if (el.windowName) el.windowName.textContent = paneName;
-      }
-      if (info.cwd && el.cwd) {
-        el.cwd.textContent = String(info.cwd).replace(/^\/home\/[^/]+/, '~');
+      if (info.intern_url && el.internUrl) {
+        el.internUrl.textContent = String(info.intern_url);
       }
       applyInjection(typeof info.injecting === 'boolean' ? info.injecting : null);
     }).catch(function () {

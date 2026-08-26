@@ -3,44 +3,33 @@
 #   cp config.example.toml ~/.config/indexd/config.toml
 #   chmod 600 ~/.config/indexd/config.toml
 #
-# Every setting except the token list also has an INDEXD_* environment
-# override, named in the comments below. The tokens deliberately do NOT, so
-# they stay out of the process environment and out of `systemctl show`.
+# Every setting except the two token lists and the internd token also has an
+# INDEXD_* environment override, named in the comments below. The secrets
+# deliberately do NOT, so they stay out of the process environment and out of
+# `systemctl show`.
 
-# port       = 7490                     # INDEXD_PORT
-# data_dir   = "~/.local/share/indexd"  # INDEXD_DATA_DIR   (SQLite lives here)
-# static_dir = "./static"               # INDEXD_STATIC     (console assets)
+# port          = 7490                     # INDEXD_PORT
+# callback_port = 7491                     # INDEXD_CALLBACK_PORT
+# data_dir      = "~/.local/share/indexd"  # INDEXD_DATA_DIR   (SQLite lives here)
+# static_dir    = "./static"               # INDEXD_STATIC     (console assets)
 
-# --- The tmux window ---------------------------------------------------------
-# window = "index MASTER"   # INDEXD_WINDOW
-# cwd    = "~"              # INDEXD_CWD  (working dir for a window we create)
-
-# Argv launched when the window is missing. Absent or empty means indexd will
-# never create a window: it refuses with an explanation instead of guessing at
-# your agent and launching the wrong process into a terminal. Create the window
-# yourself with tools/ensure-window.sh if you prefer.
+# --- Where commands go -------------------------------------------------------
+# indexd drives no tmux window. Every spoken command becomes a project in
+# internd, which owns `intern_mark MASTER` and does the typing and scraping
+# itself. `token` must match the `token` of a [[machine_client]] block in
+# internd's own config — the WHOLE Authorization header value, scheme included.
 #
-# Whatever you name here is launched unattended. If your agent stops at a
-# first-run confirmation or a permission prompt, pass whatever flag skips it —
-# nothing is present to answer that prompt, and the first request will hang.
-# agent_command = ["my-agent", "--some-non-interactive-flag"]
-
-# How indexd reads your agent's terminal. Defaults suit one popular CLI agent;
-# change them for yours.
-#
-#   streaming_marker  what the TUI prints while a turn is in flight. Its
-#                     ABSENCE is how a finished turn is detected, so it must be
-#                     shown for the whole turn and never afterwards.
-#   dismiss_marker    a first-run confirmation to dismiss with Tab. Empty
-#                     disables it; harmless either way, since it only fires
-#                     when the pane actually contains the string.
-#
-# streaming_marker = "esc to interrupt"   # INDEXD_STREAMING_MARKER
-# dismiss_marker   = "bypass permissions" # INDEXD_DISMISS_MARKER
+# The identity those commands are sent as is internd's decision, not this
+# daemon's: it comes from the [[machine_client]] block the token selects. That
+# is deliberate. Nothing indexd sends can change whose Claude session it
+# reaches.
+[intern]
+url   = "http://127.0.0.1:7472"          # INDEXD_INTERN_URL
+token = "Bearer REPLACE_ME"
 
 # --- Webhook gate (/hook) ----------------------------------------------------
-# The ONLY thing standing between the internet and a shell-capable agent
-# session. An empty list rejects every request.
+# The ONLY thing standing between the internet and a Claude session with full
+# tool access. An empty list rejects every request.
 #
 # Values are compared byte-for-byte, in constant time, against the WHOLE
 # Authorization header. List two representations of the same secret so the
@@ -56,6 +45,18 @@ tokens = [
   "REPLACE_ME",
 ]
 
+# Accepted on the callback listener (127.0.0.1:7491), which internd POSTs a
+# finished turn to. A SEPARATE list from `tokens` on purpose: the ring's secret
+# and internd's are held by different processes, and sharing one would mean a
+# leak from either could drive the other's endpoint.
+#
+# Must match `callback_token` in internd's matching [[machine_client]] block.
+# Leaving this empty is survivable but slow: every callback is refused and
+# outcomes arrive only when the sweeper next polls.
+callback_tokens = [
+  "Bearer REPLACE_ME_TOO",
+]
+
 # --- Console gate (optional) -------------------------------------------------
 # Cloudflare Access in front of the web console, verified in-process. Leave
 # unset if you are gating the console some other way (LAN only, a VPN, a
@@ -68,12 +69,20 @@ tokens = [
 
 # Hostnames this daemon answers for. Loopback only by default; add your public
 # hostname when serving through a tunnel or reverse proxy.
+#
+# This does NOT cover the callback listener, which is never fronted by the
+# tunnel and so has no public hostname to allow.
 # allowed_hosts  = ["index.example.com", "localhost", "127.0.0.1"]  # INDEXD_ALLOWED_HOSTS
 
 # --- Timeouts ----------------------------------------------------------------
 # Nothing blocks on these: the webhook returns as soon as the request is
 # recorded, so a slow turn costs nothing but is still captured.
 [timeouts]
-# primary_secs     = 90    # first wait; crossing it is logged, not fatal
-# extended_secs    = 600   # hard deadline, measured from submission
-# poll_interval_ms = 200   # how often the pane is re-read
+# intern_secs         = 15    # one HTTP call to internd
+# sweep_interval_secs = 60    # how often everything in flight is reconciled,
+#                             # and so the worst-case delay of a lost callback
+# submit_timeout_secs = 60    # give up on a command that never reached internd
+# stale_after_secs    = 3600  # give up on a running command while internd is
+#                             # unreachable. Only reached when it is down: for
+#                             # as long as it answers, its own status is
+#                             # believed however long the turn takes.
