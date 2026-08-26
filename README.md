@@ -1,7 +1,7 @@
 # indexd
 
-**A webhook bridge. Not a standalone tool — it needs
-[`internd`](https://github.com/xeb/intern) running alongside it.**
+**A webhook bridge. Not a standalone tool — it needs `internd` running alongside it, and
+`internd` is a private sibling project, so this repo is not much use on its own.**
 
 `indexd` is webhooks at both ends and nothing else in between. A webhook comes *in* from the ring's
 phone app; `indexd` submits it to `internd` over HTTP; a webhook comes *back* from `internd` when
@@ -96,9 +96,11 @@ question of when, not whether — and settling one command twice is a no-op rath
 
 - **Rust**, recent stable (edition 2021; developed on 1.97).
 - **A C compiler.** SQLite is compiled from bundled sources; TLS is rustls, so no OpenSSL.
-- **[`internd`](https://github.com/xeb/intern)**, running on the same host with a `[[machine_client]]`
-  block configured for this daemon. `indexd` has no fallback if it is missing: every spoken command
-  fails, with `internd`'s own explanation, in the console.
+- **`internd`**, running on the same host with a `[[machine_client]]` block configured for this
+  daemon. It is a private repo, so if you are reading this from outside you cannot obtain it —
+  what follows documents the contract it implements, not a package you can install. `indexd` has
+  no fallback if it is missing: every spoken command fails, with `internd`'s own explanation, in
+  the console.
 - **A Pebble Index 01** and its phone app, for the intended input path. Anything that can POST
   `multipart/form-data` works just as well — `curl` included.
 
